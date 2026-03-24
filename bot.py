@@ -21,6 +21,7 @@ from logger import log
 from market_scanner import MarketScanner
 from risk_manager import RiskManager
 from order_manager import OrderManager
+from learner import Learner
 
 
 class PolymarketLPBot:
@@ -32,6 +33,7 @@ class PolymarketLPBot:
         self.running = False
         self.scanner = MarketScanner(config)
         self.risk = RiskManager(config)
+        self.learner = Learner(config)
         self.orders: OrderManager = None  # initialized after validation
 
         # Active markets we're providing liquidity to
@@ -87,16 +89,38 @@ class PolymarketLPBot:
             log.info("No eligible markets found this scan")
             return []
 
+        # Filter out blacklisted markets
+        before_count = len(markets)
+        markets = [m for m in markets if not self.learner.is_blacklisted(m.condition_id)]
+        if len(markets) < before_count:
+            log.info(f"Learner filtered out {before_count - len(markets)} blacklisted markets")
+
+        # Re-score using learner (combines reward estimate + historical performance)
+        for m in markets:
+            m.our_share_estimate = self.learner.score_market(
+                m.condition_id, m.reward_pool, m.our_share_estimate,
+                m.spread, m.orderbook_depth_yes + m.orderbook_depth_no,
+            )
+
+        # Sort by learned score (stored in our_share_estimate for compatibility)
+        markets.sort(key=lambda m: m.our_share_estimate, reverse=True)
+
         # Limit to configured max markets
         max_markets = min(self.config.max_active_markets, len(markets))
         selected = markets[:max_markets]
 
         for m in selected:
+            # Record market entry for learning
+            self.learner.record_market_entry(
+                m.condition_id, m.question, m.spread,
+                m.reward_pool, m.orderbook_depth_yes + m.orderbook_depth_no,
+                m.volume_24h, m.our_share_estimate,
+            )
             log.info(
                 f"Selected: {m.question[:50]} | "
                 f"Reward: ${m.reward_pool:.2f}/day | "
-                f"Est. share: {m.our_share_estimate:.1%} | "
-                f"Est. daily: ${m.reward_pool * m.our_share_estimate:.2f}"
+                f"Score: {m.our_share_estimate:.2f} | "
+                f"Blacklisted: No"
             )
 
         return selected
@@ -106,14 +130,21 @@ class PolymarketLPBot:
         if self.dry_run or not self.orders:
             return
 
+        # Apply learned parameter adjustments
+        learned = self.learner.get_adjusted_params()
+        if learned:
+            log.debug(f"Applying learned params: {learned}")
+
         for market in markets:
             try:
                 # Cancel existing orders for this market
                 self.orders.cancel_market_orders(market.condition_id)
                 time.sleep(0.2)
 
-                # Place fresh two-sided quotes
-                order_ids = self.orders.place_lp_quotes(market)
+                # Place fresh two-sided quotes with learned adjustments
+                order_ids = self.orders.place_lp_quotes(
+                    market, learned_params=learned
+                )
 
                 if order_ids:
                     self.active_markets[market.condition_id] = {
@@ -140,9 +171,16 @@ class PolymarketLPBot:
             except Exception:
                 pass
 
-        # Sync any fills
+        # Sync any fills and feed to learner
         try:
-            self.orders.sync_fills()
+            fills = self.orders.sync_fills()
+            if fills:
+                for fill in fills:
+                    self.learner.record_fill(
+                        fill["condition_id"], fill["side"],
+                        fill["price"], fill["size"],
+                        fill.get("edge", self.config.min_edge),
+                    )
         except Exception:
             pass
 
@@ -170,6 +208,10 @@ class PolymarketLPBot:
                         action["side"],
                         0,  # actual proceeds will be updated on fill
                     )
+                    # Feed loss to learner
+                    self.learner.record_trade_result(
+                        action["condition_id"], -action["loss"]
+                    )
 
                 elif action["action"] == "emergency_exit":
                     # Full dump
@@ -185,6 +227,10 @@ class PolymarketLPBot:
                         action["condition_id"],
                         action["side"],
                         0,
+                    )
+                    # Feed loss to learner
+                    self.learner.record_trade_result(
+                        action["condition_id"], -action["loss"]
                     )
                     # Remove from active markets
                     self.active_markets.pop(action["condition_id"], None)
@@ -246,6 +292,10 @@ class PolymarketLPBot:
                 if scan_counter % 5 == 0:
                     log.info(self.risk.get_status_report())
 
+                # Learning report every 20 cycles
+                if scan_counter % 20 == 0 and scan_counter > 0:
+                    log.info(self.learner.get_learning_report())
+
                 scan_counter += 1
 
                 # Sleep until next cycle
@@ -269,16 +319,24 @@ class PolymarketLPBot:
         self.shutdown()
 
     def shutdown(self):
-        """Graceful shutdown - cancel all orders, save state."""
+        """Graceful shutdown - cancel all orders, save state, record learning."""
         log.warning("Shutting down bot...")
 
         if self.orders and not self.dry_run:
             log.info("Cancelling all open orders...")
             self.orders.cancel_all_orders()
 
+        # Record session-end learning
+        market_pnl = {}
+        for cid, exp in self.risk.exposures.items():
+            market_pnl[cid] = exp.realized_pnl + exp.total_unrealized_pnl
+        self.learner.record_session_end(market_pnl)
+
         self.risk.save_state()
-        log.info("State saved. Bot stopped.")
+        self.learner.save()
+        log.info("State and learning data saved. Bot stopped.")
         log.info(self.risk.get_status_report())
+        log.info(self.learner.get_learning_report())
 
 
 def main():
@@ -289,9 +347,24 @@ def main():
                         help="Show current position status and exit")
     parser.add_argument("--cancel-all", action="store_true",
                         help="Cancel all open orders and exit")
+    parser.add_argument("--learning", action="store_true",
+                        help="Show learning engine status and exit")
+    parser.add_argument("--unblacklist", type=str, default=None,
+                        help="Remove a market from the blacklist (condition_id)")
     args = parser.parse_args()
 
     config = BotConfig()
+
+    if args.learning:
+        learner = Learner(config)
+        print(learner.get_learning_report())
+        return
+
+    if args.unblacklist:
+        learner = Learner(config)
+        learner.unblacklist(args.unblacklist)
+        print(f"Unblacklisted market {args.unblacklist}")
+        return
 
     if args.status:
         risk = RiskManager(config)

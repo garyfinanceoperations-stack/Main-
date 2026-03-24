@@ -155,19 +155,26 @@ class OrderManager:
             log.error(f"Failed to place order: {e}")
             return None
 
-    def place_lp_quotes(self, market: MarketInfo) -> list[str]:
+    def place_lp_quotes(self, market: MarketInfo,
+                        learned_params: dict | None = None) -> list[str]:
         """
         Place two-sided LP quotes (both YES and NO) for a market.
+        learned_params can override min_edge, max_edge, order_size_multiplier.
         Returns list of order IDs placed.
         """
         order_ids = []
         midpoint = market.midpoint
+        lp = learned_params or {}
+
+        min_edge = lp.get("min_edge", self.config.min_edge)
+        max_edge = lp.get("max_edge", self.config.max_edge)
+        size_mult = lp.get("order_size_multiplier", 1.0)
 
         # Calculate price levels
         for level in range(self.config.num_price_levels):
             edge = (
-                self.config.min_edge
-                + (self.config.max_edge - self.config.min_edge)
+                min_edge
+                + (max_edge - min_edge)
                 * level / max(1, self.config.num_price_levels - 1)
             )
 
@@ -178,7 +185,7 @@ class OrderManager:
 
             # Size decreases slightly for levels further from mid
             size_multiplier = 1.0 - (level * 0.15)
-            level_size = self.config.order_size * size_multiplier
+            level_size = self.config.order_size * size_multiplier * size_mult
 
             # Ensure we meet minimum size requirement
             if level_size < market.min_size:
@@ -302,14 +309,16 @@ class OrderManager:
         log.critical(f"EMERGENCY DUMP: {size:.2f} shares of {token_id[:16]}")
         return self.market_sell(token_id, size, condition_id, partial=False)
 
-    def sync_fills(self):
+    def sync_fills(self) -> list[dict]:
         """
         Check for filled orders and update risk manager positions.
+        Returns list of fill dicts for the learner.
         """
+        fills = []
         try:
             trades = self.client.get_trades()
             if not isinstance(trades, list):
-                return
+                return fills
 
             for trade in trades:
                 order_id = trade.get("order_id", trade.get("orderID", ""))
@@ -329,11 +338,20 @@ class OrderManager:
                             fill_size,
                             order_id,
                         )
+                        fills.append({
+                            "condition_id": info["condition_id"],
+                            "side": side,
+                            "price": fill_price,
+                            "size": fill_size,
+                            "edge": abs(fill_price - 0.5),  # approximate edge
+                        })
                     # Remove from active orders
                     self.active_orders.pop(order_id, None)
 
         except Exception as e:
             log.debug(f"Error syncing fills: {e}")
+
+        return fills
 
     def get_balances(self) -> dict:
         """Get token balances."""
