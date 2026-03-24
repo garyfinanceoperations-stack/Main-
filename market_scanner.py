@@ -104,17 +104,48 @@ class MarketScanner:
 
     def _has_rewards(self, market: dict) -> bool:
         """Check if a market dictionary indicates it has active rewards."""
-        # Check various field names used by different API versions
-        for key in ["rewards", "rewardsDaily", "rewards_daily_rate",
-                     "rewardsDailyRate", "liquidityRewards"]:
+        # CLOB API nests under "rewards" object with "rates" inside
+        rewards_obj = market.get("rewards", {})
+        if isinstance(rewards_obj, dict):
+            rates = rewards_obj.get("rates")
+            if rates:
+                try:
+                    # rates can be a list of dicts or a single value
+                    if isinstance(rates, list):
+                        return any(float(r.get("rewards_daily_rate", 0)) > 0 for r in rates)
+                    return float(rates) > 0
+                except (ValueError, TypeError):
+                    pass
+
+        # Gamma API / flat field fallbacks
+        for key in ["rewardsDaily", "rewards_daily_rate",
+                     "rewardsDailyRate", "liquidityRewards", "clobRewards"]:
             val = market.get(key)
-            if val and float(val) > 0:
-                return True
+            if val:
+                try:
+                    if isinstance(val, dict):
+                        return bool(val)
+                    return float(val) > 0
+                except (ValueError, TypeError):
+                    continue
         return False
 
     def _get_reward_amount(self, market: dict) -> float:
         """Extract the daily reward amount from a market dict."""
-        for key in ["rewards", "rewardsDaily", "rewards_daily_rate",
+        # CLOB API: nested rewards.rates structure
+        rewards_obj = market.get("rewards", {})
+        if isinstance(rewards_obj, dict):
+            rates = rewards_obj.get("rates")
+            if rates:
+                try:
+                    if isinstance(rates, list):
+                        return sum(float(r.get("rewards_daily_rate", 0)) for r in rates)
+                    return float(rates)
+                except (ValueError, TypeError):
+                    pass
+
+        # Gamma API flat fields
+        for key in ["rewardsDaily", "rewards_daily_rate",
                      "rewardsDailyRate", "liquidityRewards", "rewardsAmount"]:
             val = market.get(key)
             if val:
@@ -126,6 +157,18 @@ class MarketScanner:
 
     def _get_max_spread(self, market: dict) -> float:
         """Get the max spread for reward eligibility."""
+        # CLOB API nested
+        rewards_obj = market.get("rewards", {})
+        if isinstance(rewards_obj, dict):
+            for key in ["max_spread", "maxSpread"]:
+                val = rewards_obj.get(key)
+                if val:
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        pass
+
+        # Flat field fallbacks
         for key in ["rewardsMaxSpread", "rewards_max_spread",
                      "maxIncentiveSpread", "max_incentive_spread"]:
             val = market.get(key)
@@ -138,6 +181,18 @@ class MarketScanner:
 
     def _get_min_size(self, market: dict) -> float:
         """Get the minimum order size for reward eligibility."""
+        # CLOB API nested
+        rewards_obj = market.get("rewards", {})
+        if isinstance(rewards_obj, dict):
+            for key in ["min_size", "minSize"]:
+                val = rewards_obj.get(key)
+                if val:
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        pass
+
+        # Flat field fallbacks
         for key in ["rewardsMinSize", "rewards_min_size",
                      "minIncentiveSize", "min_incentive_size"]:
             val = market.get(key)

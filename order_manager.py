@@ -32,13 +32,7 @@ class OrderManager:
             )
 
             # Create or derive API credentials
-            try:
-                self.api_creds = self.client.derive_api_key()
-                log.info("Derived existing API key")
-            except Exception:
-                self.api_creds = self.client.create_api_key()
-                log.info("Created new API key")
-
+            self.api_creds = self.client.create_or_derive_api_creds()
             self.client.set_api_creds(self.api_creds)
             log.info(f"CLOB client initialized for chain {self.config.chain_id}")
 
