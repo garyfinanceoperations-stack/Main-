@@ -292,7 +292,7 @@ class RiskManager:
         total_unrealized = sum(
             e.total_unrealized_pnl for e in self.exposures.values()
         )
-        if total_unrealized < -100:  # portfolio stop-loss at -$100
+        if total_unrealized < -self.config.portfolio_stop_loss:
             self.emergency_mode = True
             log.critical(
                 f"PORTFOLIO STOP-LOSS: Total unrealized PnL ${total_unrealized:.2f} "

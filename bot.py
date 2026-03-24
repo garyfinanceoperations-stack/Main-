@@ -87,8 +87,8 @@ class PolymarketLPBot:
             log.info("No eligible markets found this scan")
             return []
 
-        # Limit to manageable number of markets
-        max_markets = min(5, len(markets))
+        # Limit to configured max markets
+        max_markets = min(self.config.max_active_markets, len(markets))
         selected = markets[:max_markets]
 
         for m in selected:

@@ -16,21 +16,23 @@ class BotConfig:
     chain_id: int = int(os.getenv("CHAIN_ID", "137"))
 
     # Risk limits
-    max_exposure_per_market: float = float(os.getenv("MAX_EXPOSURE_PER_MARKET", "200"))
+    max_exposure_per_market: float = float(os.getenv("MAX_EXPOSURE_PER_MARKET", "120"))
     max_loss_per_position: float = float(os.getenv("MAX_LOSS_PER_POSITION", "10"))
-    emergency_loss_threshold: float = float(os.getenv("EMERGENCY_LOSS_THRESHOLD", "30"))
+    emergency_loss_threshold: float = float(os.getenv("EMERGENCY_LOSS_THRESHOLD", "25"))
+    portfolio_stop_loss: float = float(os.getenv("PORTFOLIO_STOP_LOSS", "80"))
 
     # Market filters
     min_reward_pool: float = float(os.getenv("MIN_REWARD_POOL", "30"))
     max_orderbook_depth: float = float(os.getenv("MAX_ORDERBOOK_DEPTH", "50"))
     max_spread_gap: float = float(os.getenv("MAX_SPREAD_GAP", "5")) / 100  # convert cents to decimal
     min_reward_share_target: float = float(os.getenv("MIN_REWARD_SHARE_TARGET", "30")) / 100
+    max_active_markets: int = int(os.getenv("MAX_ACTIVE_MARKETS", "5"))
 
     # Order parameters
-    order_size: float = float(os.getenv("ORDER_SIZE", "15"))
-    num_price_levels: int = int(os.getenv("NUM_PRICE_LEVELS", "3"))
+    order_size: float = float(os.getenv("ORDER_SIZE", "10"))
+    num_price_levels: int = int(os.getenv("NUM_PRICE_LEVELS", "2"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.5")) / 100  # cents to decimal
-    max_edge: float = float(os.getenv("MAX_EDGE", "3.0")) / 100
+    max_edge: float = float(os.getenv("MAX_EDGE", "2.5")) / 100
 
     # Timing
     scan_interval: int = int(os.getenv("SCAN_INTERVAL", "60"))
