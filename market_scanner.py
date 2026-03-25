@@ -494,18 +494,47 @@ class MarketScanner:
                 if stats["checked"] % 100 == 0:
                     log.info(f"  ...checked {stats['checked']} books, {len(eligible)} eligible...")
 
-                # === RULE 1: Midpoint must be 0.40-0.60 ===
+                # === RULE 1: Determine midpoint ===
                 yes_bids = book_yes.get("bids", [])
                 yes_asks = book_yes.get("asks", [])
 
-                if yes_bids and yes_asks:
-                    mid = (float(yes_bids[0]["price"]) + float(yes_asks[0]["price"])) / 2
-                elif yes_bids:
-                    mid = float(yes_bids[0]["price"])
-                elif yes_asks:
-                    mid = float(yes_asks[0]["price"])
+                # Find the REAL midpoint — where orders actually cluster
+                # Many markets have orders only at extremes (0.001/0.999)
+                # with a huge empty gap in the middle — that's our opportunity
+                real_yes_bid = 0.0
+                real_yes_ask = 0.0
+
+                # Find highest bid that's > 0.10 (ignore dust bids at 0.001)
+                for b in yes_bids:
+                    p = float(b["price"])
+                    if p >= 0.10:
+                        real_yes_bid = p
+                        break
+                # Find lowest ask that's < 0.90 (ignore asks at 0.999)
+                for a in yes_asks:
+                    p = float(a["price"])
+                    if p <= 0.90:
+                        real_yes_ask = p
+                        break
+
+                # Determine midpoint and whether the book center is empty
+                center_is_empty = False
+                if real_yes_bid > 0 and real_yes_ask > 0:
+                    mid = (real_yes_bid + real_yes_ask) / 2
+                    spread = real_yes_ask - real_yes_bid
+                elif real_yes_bid > 0:
+                    mid = real_yes_bid + 0.02
+                    spread = 0.04
+                    center_is_empty = True
+                elif real_yes_ask > 0:
+                    mid = real_yes_ask - 0.02
+                    spread = 0.04
+                    center_is_empty = True
                 else:
-                    mid = 0.5  # empty book, assume 50/50
+                    # No orders near center at all — fully empty
+                    mid = 0.5
+                    spread = 0.0
+                    center_is_empty = True
 
                 if mid < 0.40 or mid > 0.60:
                     stats["bad_midpoint"] += 1
@@ -524,52 +553,69 @@ class MarketScanner:
 
                 is_thin = max_depth_usd < 150.0 or max_shares < 500
 
-                # === RULE 3: Spread check (2-6 cents) ===
-                yes_best_bid, yes_best_ask = self._get_best_bid_ask_near_mid(book_yes, mid)
-                no_best_bid, no_best_ask = self._get_best_bid_ask_near_mid(book_no, no_mid)
+                # If center is empty, it's always thin where we'd place orders
+                if center_is_empty:
+                    is_thin = True
 
-                # Handle empty books - we set our own spread
-                book_is_empty = (yes_best_bid == 0 and yes_best_ask == 0)
-                if book_is_empty:
-                    yes_best_bid = mid - 0.02
-                    yes_best_ask = mid + 0.02
-                    no_best_bid = no_mid - 0.02
-                    no_best_ask = no_mid + 0.02
-                    spread = 0.04  # our spread
-                else:
-                    if yes_best_bid > 0 and yes_best_ask > 0:
-                        spread = yes_best_ask - yes_best_bid
-                    else:
-                        spread = 0.10  # only one side, wide
+                # === RULE 3: Spread and best bid/ask ===
+                yes_best_bid = real_yes_bid if real_yes_bid > 0 else 0.0
+                yes_best_ask = real_yes_ask if real_yes_ask > 0 else 0.0
+
+                # Find NO side best bid/ask near mid too
+                no_best_bid = 0.0
+                no_best_ask = 0.0
+                for b in book_no.get("bids", []):
+                    p = float(b["price"])
+                    if p >= 0.10:
+                        no_best_bid = p
+                        break
+                for a in book_no.get("asks", []):
+                    p = float(a["price"])
+                    if p <= 0.90:
+                        no_best_ask = p
+                        break
+
+                # Set defaults for empty/center-empty books
+                book_is_empty = center_is_empty and yes_best_bid == 0 and yes_best_ask == 0
+                if book_is_empty or center_is_empty:
+                    if yes_best_bid == 0:
+                        yes_best_bid = mid - 0.02
+                    if yes_best_ask == 0:
+                        yes_best_ask = mid + 0.02
+                    if no_best_bid == 0:
+                        no_best_bid = no_mid - 0.02
+                    if no_best_ask == 0:
+                        no_best_ask = no_mid + 0.02
 
                 # Spread must be >= 2c and <= 6c for primary targets
-                spread_ok = 0.02 <= spread <= 0.06
+                # Center-empty books are always OK (we define the spread)
+                spread_ok = center_is_empty or (0.02 <= spread <= 0.06)
 
                 # === RULE 5: Reward share estimate ===
-                share = self._estimate_reward_share(market, book_yes, book_no)
+                if center_is_empty:
+                    share = 1.0  # we'd be the only LP near the center
+                else:
+                    share = self._estimate_reward_share(market, book_yes, book_no)
 
                 volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
 
                 # === DECISION: Primary target or fallback? ===
                 is_fallback = False
 
-                if is_thin and (spread_ok or book_is_empty):
+                if center_is_empty:
+                    # Empty center = PRIMARY — we'd be the only LP
+                    pass
+                elif is_thin and spread_ok:
                     # PRIMARY TARGET: thin book, good spread
                     pass
-                elif not is_thin and volume > 0:
-                    # === RULE 6: FALLBACK - thick book but has volume ===
-                    # We post 1c better than best order with min shares
+                elif is_thin and not spread_ok:
+                    # Thin book, spread > 6c — post 1c better than best
                     is_fallback = True
                     stats["fallback"] += 1
-                elif is_thin and not spread_ok:
-                    # Thin book but spread outside 2-6c range
-                    # If gap > 6c we can still post 1c better than best
-                    if spread > 0.06 and (yes_best_bid > 0 or yes_best_ask > 0):
-                        is_fallback = True
-                        stats["fallback"] += 1
-                    else:
-                        stats["bad_spread"] += 1
-                        continue
+                elif not is_thin and volume > 0:
+                    # FALLBACK: thick book but has volume
+                    is_fallback = True
+                    stats["fallback"] += 1
                 else:
                     stats["too_thick"] += 1
                     continue
