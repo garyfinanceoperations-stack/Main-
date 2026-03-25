@@ -78,10 +78,40 @@ class MarketScanner:
         return markets
 
     def get_rewards_markets(self) -> list[dict]:
-        """Fetch markets that have active reward pools."""
-        # Try multiple endpoints - Polymarket API evolves frequently
+        """Fetch active markets from all available sources."""
+        all_found = {}  # condition_id -> market dict (dedup)
 
-        # Attempt 1: CLOB /markets with rewards included
+        # Source 1: Gamma API /markets - most reliable, returns many markets
+        try:
+            offset = 0
+            while offset < 600:  # fetch up to 600 markets
+                resp = self._session.get(
+                    f"{self.gamma_url}/markets",
+                    params={
+                        "active": True,
+                        "closed": False,
+                        "limit": 100,
+                        "offset": offset,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+                if not batch:
+                    break
+                for m in batch:
+                    cid = m.get("conditionId", m.get("condition_id", ""))
+                    if cid:
+                        all_found[cid] = m
+                if len(batch) < 100:
+                    break
+                offset += 100
+                time.sleep(0.2)
+            log.info(f"Gamma /markets: {len(all_found)} active markets")
+        except Exception as e:
+            log.warning(f"Gamma /markets failed: {e}")
+
+        # Source 2: CLOB /markets - may have reward data the Gamma API lacks
         try:
             resp = self._session.get(
                 f"{self.clob_url}/markets",
@@ -91,72 +121,46 @@ class MarketScanner:
             data = resp.json()
             if isinstance(data, dict):
                 data = data.get("data", data.get("markets", []))
-            if isinstance(data, list) and data:
-                rewarded = [m for m in data if self._has_rewards(m)]
-                if rewarded:
-                    log.info(f"Found {len(rewarded)} reward markets via CLOB /markets")
-                    return rewarded
+            if isinstance(data, list):
+                for m in data:
+                    cid = m.get("conditionId", m.get("condition_id", ""))
+                    if cid:
+                        # Merge reward data into existing entry
+                        if cid in all_found:
+                            if self._has_rewards(m):
+                                all_found[cid].update({
+                                    k: v for k, v in m.items()
+                                    if "reward" in k.lower() or "incentive" in k.lower()
+                                })
+                        else:
+                            all_found[cid] = m
+                log.info(f"CLOB /markets: merged, total {len(all_found)} markets")
         except Exception as e:
             log.debug(f"CLOB /markets: {e}")
 
-        # Attempt 2: CLOB /rewards/markets (legacy)
-        try:
-            resp = self._session.get(
-                f"{self.clob_url}/rewards/markets",
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data:
-                log.info(f"Found {len(data)} reward markets via CLOB /rewards/markets")
-                return data
-        except Exception as e:
-            log.debug(f"CLOB /rewards/markets: {e}")
+        # Source 3: Gamma /events - catches markets not in /markets
+        if len(all_found) < 20:
+            try:
+                resp = self._session.get(
+                    f"{self.gamma_url}/events",
+                    params={"active": True, "closed": False, "limit": 100},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                events = resp.json()
+                for event in events:
+                    for m in event.get("markets", []):
+                        cid = m.get("conditionId", m.get("condition_id", ""))
+                        if cid and cid not in all_found:
+                            m["question"] = m.get("question", event.get("title", ""))
+                            all_found[cid] = m
+                log.info(f"After /events: total {len(all_found)} markets")
+            except Exception as e:
+                log.debug(f"Gamma /events: {e}")
 
-        # Attempt 3: Gamma API - most reliable fallback
-        try:
-            resp = self._session.get(
-                f"{self.gamma_url}/markets",
-                params={
-                    "active": True,
-                    "closed": False,
-                    "limit": 200,
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            rewarded = [m for m in data if self._has_rewards(m)]
-            if rewarded:
-                log.info(f"Found {len(rewarded)} reward markets via Gamma API")
-                return rewarded
-            # If no rewarded markets found, return all active (user can filter)
-            log.warning("No reward fields found - returning all active markets")
-            return data
-        except Exception as e:
-            log.error(f"Gamma API also failed: {e}")
-
-        # Attempt 4: Gamma API events endpoint
-        try:
-            resp = self._session.get(
-                f"{self.gamma_url}/events",
-                params={"active": True, "closed": False, "limit": 100},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            events = resp.json()
-            markets = []
-            for event in events:
-                for m in event.get("markets", []):
-                    m["question"] = m.get("question", event.get("title", ""))
-                    markets.append(m)
-            if markets:
-                log.info(f"Found {len(markets)} markets via Gamma /events")
-                return markets
-        except Exception as e:
-            log.error(f"All market fetch attempts failed: {e}")
-
-        return []
+        result = list(all_found.values())
+        log.info(f"Total markets to scan: {len(result)}")
+        return result
 
     def _has_rewards(self, market: dict) -> bool:
         """Check if a market dictionary indicates it has active rewards."""
