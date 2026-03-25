@@ -172,6 +172,12 @@ class OrderManager:
                         learned_params: dict | None = None) -> list[str]:
         """
         Place two-sided LP quotes (both YES and NO) for a market.
+
+        Strategy:
+        - Normal markets: place at midpoint ± edge
+        - Fallback/wide-spread markets: post 1c better than best existing order
+        - Always maintain >= 2c gap between YES and NO prices
+
         learned_params can override min_edge, max_edge, order_size_multiplier.
         Returns list of order IDs placed.
         """
@@ -182,6 +188,9 @@ class OrderManager:
         min_edge = lp.get("min_edge", self.config.min_edge)
         max_edge = lp.get("max_edge", self.config.max_edge)
         size_mult = lp.get("order_size_multiplier", 1.0)
+
+        # For fallback markets or wide spreads: post 1c better than best order
+        use_undercut = market.is_fallback or market.spread > 0.06
 
         # Calculate price levels
         for level in range(self.config.num_price_levels):
@@ -204,8 +213,17 @@ class OrderManager:
             if level_size < market.min_size:
                 level_size = market.min_size
 
+            # For fallback: use minimum size to limit exposure
+            if market.is_fallback:
+                level_size = max(market.min_size, 5.0)
+
             # === YES side ===
-            yes_bid_price = round(midpoint - edge, 4)
+            if use_undercut and market.yes_bid > 0:
+                # Post 1 cent better than the current best bid
+                yes_bid_price = round(market.yes_bid + 0.01, 4)
+            else:
+                yes_bid_price = round(midpoint - edge, 4)
+
             yes_ask_price = round(midpoint + edge, 4)
 
             # Clamp prices to valid range
@@ -226,10 +244,21 @@ class OrderManager:
             # For initial LP, we buy on both sides to provide liquidity
 
             # === NO side ===
-            no_bid_price = round((1 - midpoint) - edge, 4)
+            if use_undercut and market.no_bid > 0:
+                no_bid_price = round(market.no_bid + 0.01, 4)
+            else:
+                no_bid_price = round((1 - midpoint) - edge, 4)
             no_ask_price = round((1 - midpoint) + edge, 4)
             no_bid_price = max(0.01, min(0.99, no_bid_price))
             no_ask_price = max(0.01, min(0.99, no_ask_price))
+
+            # Safety: YES bid + NO bid must be <= $0.98 (2c gap minimum)
+            if yes_bid_price + no_bid_price > 0.98:
+                # Scale both down equally to maintain gap
+                excess = (yes_bid_price + no_bid_price) - 0.98
+                yes_bid_price = round(yes_bid_price - excess / 2, 4)
+                no_bid_price = round(no_bid_price - excess / 2, 4)
+                log.debug(f"Adjusted prices for 2c gap: YES={yes_bid_price} NO={no_bid_price}")
 
             # Place NO BID (buy NO tokens)
             shares_no_bid = round(level_size / no_bid_price, 2) if no_bid_price > 0 else 0
