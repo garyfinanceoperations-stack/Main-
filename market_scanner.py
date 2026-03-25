@@ -500,57 +500,64 @@ class MarketScanner:
                     skipped_thick_book += 1
                     continue
 
-                # Get best bid/ask for YES
-                yes_bids = book_yes.get("bids", [])
-                yes_asks = book_yes.get("asks", [])
-                if not yes_bids or not yes_asks:
-                    skipped_empty_book += 1
-                    continue
+                # Get best bid/ask - empty books are OK (we'd be the only LP)
+                yes_bids_list = book_yes.get("bids", [])
+                yes_asks_list = book_yes.get("asks", [])
+                no_bids_list = book_no.get("bids", [])
+                no_asks_list = book_no.get("asks", [])
 
-                yes_bid = float(yes_bids[0]["price"])
-                yes_ask = float(yes_asks[0]["price"])
+                # Use book prices if available, otherwise default to midpoint estimate
+                yes_bid = float(yes_bids_list[0]["price"]) if yes_bids_list else est_mid - 0.02
+                yes_ask = float(yes_asks_list[0]["price"]) if yes_asks_list else est_mid + 0.02
+                no_bid = float(no_bids_list[0]["price"]) if no_bids_list else (1 - est_mid) - 0.02
+                no_ask = float(no_asks_list[0]["price"]) if no_asks_list else (1 - est_mid) + 0.02
 
-                # Get best bid/ask for NO
-                no_bids = book_no.get("bids", [])
-                no_asks = book_no.get("asks", [])
-                if not no_bids or not no_asks:
-                    skipped_empty_book += 1
-                    continue
-
-                no_bid = float(no_bids[0]["price"])
-                no_ask = float(no_asks[0]["price"])
-
-                # Calculate spread
+                # Calculate spread (or use our planned spread for empty books)
                 yes_spread = yes_ask - yes_bid
                 no_spread = no_ask - no_bid
                 avg_spread = (yes_spread + no_spread) / 2
+
+                midpoint = (yes_bid + yes_ask) / 2
+
+                # Our YES and NO orders must be at least 2 cents apart
+                # YES bid at (midpoint - edge), NO bid at (1 - midpoint - edge)
+                # Combined: YES + NO prices should sum to < 0.98 (i.e. 2c gap)
+                our_yes_price = midpoint - self.config.min_edge
+                our_no_price = (1 - midpoint) - self.config.min_edge
+                order_gap = 1.0 - (our_yes_price + our_no_price)
+                if order_gap < 0.02:
+                    skipped_wide_spread += 1
+                    continue
 
                 # Calculate book depth
                 depth_yes = self._calculate_book_depth(book_yes, "bids") + self._calculate_book_depth(book_yes, "asks")
                 depth_no = self._calculate_book_depth(book_no, "bids") + self._calculate_book_depth(book_no, "asks")
 
-                # Estimate our reward share
+                # Estimate our reward share (100% if empty book)
                 share = self._estimate_reward_share(market, book_yes, book_no)
 
                 question = market.get("question", market.get("title", "Unknown"))[:60]
+                empty_tag = ""
+                if not yes_bids_list or not yes_asks_list or not no_bids_list or not no_asks_list:
+                    empty_tag = " [EMPTY BOOK - WE'D BE ONLY LP]"
 
                 # Log details for first 10 markets that pass thin-book check
                 if debug_logged < 10:
                     debug_logged += 1
                     log.info(
                         f"  THIN BOOK: {question} | "
-                        f"spread: {avg_spread:.4f} (max: {self.config.max_spread_gap:.4f}) | "
-                        f"share: {share:.1%} (min: {self.config.min_reward_share_target:.0%}) | "
+                        f"spread: {avg_spread:.4f} | "
+                        f"share: {share:.1%} | "
                         f"depth: ${depth_yes:.0f}+${depth_no:.0f} | "
-                        f"reward: ${reward_amount:.0f}"
+                        f"reward: ${reward_amount:.0f}{empty_tag}"
                     )
 
-                # Filter: spread must be < MAX_SPREAD_GAP (5 cents)
-                if avg_spread > self.config.max_spread_gap:
+                # Filter: existing spread must be < MAX_SPREAD_GAP (5 cents)
+                # But skip this check if book is empty (we set our own spread)
+                has_full_book = yes_bids_list and yes_asks_list and no_bids_list and no_asks_list
+                if has_full_book and avg_spread > self.config.max_spread_gap:
                     skipped_wide_spread += 1
                     continue
-
-                midpoint = (yes_bid + yes_ask) / 2
 
                 # Filter: we want at least MIN_REWARD_SHARE_TARGET
                 if share < self.config.min_reward_share_target:
