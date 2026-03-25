@@ -315,20 +315,27 @@ class MarketScanner:
             total += price * size
         return total
 
-    def _check_thin_book(self, book: dict) -> bool:
-        """Check if the order book has thin liquidity (< $50 per price level)."""
+    def _check_thin_book(self, book: dict, midpoint: float = 0.5) -> bool:
+        """
+        Check if the order book has thin liquidity near the midpoint.
+        Only checks orders within 10 cents of midpoint - extreme prices
+        (like $0.001 or $0.999) are irrelevant for LP competition.
+        """
         for side in ["bids", "asks"]:
             orders = book.get(side, [])
-            # Group by price level and check each is under our threshold
             price_levels = {}
             for order in orders:
-                price = order.get("price", "0")
+                price = float(order.get("price", "0"))
                 size = float(order.get("size", 0))
-                price_levels[price] = price_levels.get(price, 0) + size * float(price)
+                # Only count orders within 10 cents of midpoint
+                if abs(price - midpoint) > 0.10:
+                    continue
+                key = str(round(price, 4))
+                price_levels[key] = price_levels.get(key, 0) + size * price
 
             for _price, dollar_value in price_levels.items():
                 if dollar_value > self.config.max_orderbook_depth:
-                    return False  # too thick, dominated by bigger players
+                    return False  # too thick near midpoint
         return True
 
     def _estimate_reward_share(self, market: dict, book_yes: dict, book_no: dict) -> float:
@@ -450,39 +457,46 @@ class MarketScanner:
                 if checked_books % 50 == 0:
                     log.info(f"  ...checked {checked_books} order books so far, {len(eligible)} eligible...")
 
-                # Dump raw book for first market so we can see actual field values
-                if checked_books == 1:
-                    question = market.get("question", market.get("title", "?"))[:50]
-                    log.info(f"  RAW BOOK DUMP for: {question}")
-                    for label, book in [("YES", book_yes), ("NO", book_no)]:
-                        bids = book.get("bids", [])[:3]
-                        asks = book.get("asks", [])[:3]
-                        log.info(f"    {label} bids (top 3): {bids}")
-                        log.info(f"    {label} asks (top 3): {asks}")
+                # Estimate midpoint from YES book for thin-book check
+                yes_bids_raw = book_yes.get("bids", [])
+                yes_asks_raw = book_yes.get("asks", [])
+                if yes_bids_raw and yes_asks_raw:
+                    est_mid = (float(yes_bids_raw[0]["price"]) + float(yes_asks_raw[0]["price"])) / 2
+                else:
+                    est_mid = 0.5
 
-                # Measure max USD depth per price level for diagnostics
+                # Check thin book - only orders within 10c of midpoint matter
+                is_thin = (
+                    self._check_thin_book(book_yes, est_mid) and
+                    self._check_thin_book(book_no, 1.0 - est_mid)
+                )
+
+                # Measure depth near midpoint for diagnostics
                 max_level_usd = 0.0
-                for book in [book_yes, book_no]:
+                for book_data, mid in [(book_yes, est_mid), (book_no, 1.0 - est_mid)]:
                     for side in ["bids", "asks"]:
                         price_levels = {}
-                        for order in book.get(side, []):
+                        for order in book_data.get(side, []):
                             price = float(order.get("price", "0"))
                             size = float(order.get("size", 0))
-                            price_levels[str(price)] = price_levels.get(str(price), 0) + size * price
+                            if abs(price - mid) > 0.10:
+                                continue
+                            key = str(round(price, 4))
+                            price_levels[key] = price_levels.get(key, 0) + size * price
                         for d in price_levels.values():
                             max_level_usd = max(max_level_usd, d)
                 depth_samples.append(max_level_usd)
 
-                is_thin = self._check_thin_book(book_yes) and self._check_thin_book(book_no)
-
-                # Log first 20 depth samples in USD
+                # Log first 20 depth samples
                 if len(depth_samples) <= 20:
                     question = market.get("question", market.get("title", "?"))[:50]
                     status = "THIN" if is_thin else "THICK"
-                    log.info(f"  [{status}] ${max_level_usd:.2f}/level | limit: ${self.config.max_orderbook_depth:.0f} | {question}")
+                    log.info(
+                        f"  [{status}] ${max_level_usd:.2f}/level near mid({est_mid:.2f}) | "
+                        f"limit: ${self.config.max_orderbook_depth:.0f} | {question}"
+                    )
 
-                # Check thin book condition
-                if not self._check_thin_book(book_yes) or not self._check_thin_book(book_no):
+                if not is_thin:
                     skipped_thick_book += 1
                     continue
 
