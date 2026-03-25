@@ -24,7 +24,7 @@ class BotConfig:
     # Market filters
     min_reward_pool: float = float(os.getenv("MIN_REWARD_POOL", "20"))
     max_orderbook_depth: float = float(os.getenv("MAX_ORDERBOOK_DEPTH", "120"))
-    max_spread_gap: float = float(os.getenv("MAX_SPREAD_GAP", "5")) / 100  # convert cents to decimal
+    max_spread_gap: float = float(os.getenv("MAX_SPREAD_GAP", "6")) / 100  # convert cents to decimal
     min_reward_share_target: float = float(os.getenv("MIN_REWARD_SHARE_TARGET", "20")) / 100
     max_active_markets: int = int(os.getenv("MAX_ACTIVE_MARKETS", "5"))
 
