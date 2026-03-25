@@ -387,27 +387,11 @@ class MarketScanner:
         skipped_empty_book = 0
         skipped_wide_spread = 0
         skipped_low_share = 0
+        checked_books = 0
 
         for market in all_markets:
             try:
-                # Extract reward amount - treat 0 as "unknown" and still consider market
-                reward_amount = self._get_reward_amount(market)
-                if reward_amount > 0 and reward_amount < self.config.min_reward_pool:
-                    skipped_no_reward += 1
-                    continue
-
-                # If reward amount is 0/unknown, estimate from liquidity as a proxy
-                if reward_amount == 0:
-                    liquidity = float(market.get("liquidity", 0) or 0)
-                    volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
-                    if liquidity > 0 or volume > 0:
-                        # Assume market might have rewards - let it through
-                        reward_amount = max(20.0, liquidity * 0.01, volume * 0.005)
-                    else:
-                        skipped_no_reward += 1
-                        continue
-
-                # Get token IDs - handle both list and JSON string formats
+                # Get token IDs first - handle both list and JSON string formats
                 tokens = market.get("clobTokenIds", market.get("clob_token_ids", []))
                 if isinstance(tokens, str):
                     try:
@@ -434,15 +418,39 @@ class MarketScanner:
                 token_no = tokens[1]
                 condition_id = market.get("conditionId", market.get("condition_id", ""))
 
+                # Extract reward amount - we'll use it for scoring but don't hard-filter on it
+                reward_amount = self._get_reward_amount(market)
+
+                # Estimate from liquidity/volume if no reward data
+                if reward_amount == 0:
+                    liquidity = float(market.get("liquidity", 0) or 0)
+                    volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
+                    if liquidity > 0 or volume > 0:
+                        reward_amount = max(10.0, liquidity * 0.01, volume * 0.005)
+
+                # Skip markets with known low rewards
+                if reward_amount > 0 and reward_amount < self.config.min_reward_pool:
+                    skipped_no_reward += 1
+                    continue
+
+                # If reward_amount is still 0 (no data at all), let thin-book ones through
+                # They might have rewards we can't see from the API
+                if reward_amount == 0:
+                    reward_amount = 20.0  # assume minimum, will be validated by book quality
+
                 # Get order books for both sides
                 book_yes = self.get_orderbook(token_yes)
                 book_no = self.get_orderbook(token_no)
+                checked_books += 1
                 time.sleep(0.15)  # rate limiting
+
+                # Log progress every 50 book checks
+                if checked_books % 50 == 0:
+                    log.info(f"  ...checked {checked_books} order books so far, {len(eligible)} eligible...")
 
                 # Check thin book condition
                 if not self._check_thin_book(book_yes) or not self._check_thin_book(book_no):
                     skipped_thick_book += 1
-                    log.debug(f"Skipping {condition_id[:16]}: book too thick")
                     continue
 
                 # Get best bid/ask for YES
