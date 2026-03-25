@@ -1,5 +1,6 @@
 """Market scanner - finds eligible markets for LP based on reward pools, spreads, and volume."""
 
+import json
 import time
 import requests
 from dataclasses import dataclass, field
@@ -376,16 +377,53 @@ class MarketScanner:
 
         log.info(f"Scanning {len(all_markets)} markets for LP opportunities...")
 
+        skipped_no_reward = 0
+        skipped_no_tokens = 0
+        skipped_thick_book = 0
+        skipped_empty_book = 0
+        skipped_wide_spread = 0
+        skipped_low_share = 0
+
         for market in all_markets:
             try:
-                # Extract reward amount
+                # Extract reward amount - treat 0 as "unknown" and still consider market
                 reward_amount = self._get_reward_amount(market)
-                if reward_amount < self.config.min_reward_pool:
+                if reward_amount > 0 and reward_amount < self.config.min_reward_pool:
+                    skipped_no_reward += 1
                     continue
 
-                # Get token IDs
+                # If reward amount is 0/unknown, estimate from liquidity as a proxy
+                if reward_amount == 0:
+                    liquidity = float(market.get("liquidity", 0) or 0)
+                    volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
+                    if liquidity > 0 or volume > 0:
+                        # Assume market might have rewards - let it through
+                        reward_amount = max(20.0, liquidity * 0.01, volume * 0.005)
+                    else:
+                        skipped_no_reward += 1
+                        continue
+
+                # Get token IDs - handle both list and JSON string formats
                 tokens = market.get("clobTokenIds", market.get("clob_token_ids", []))
+                if isinstance(tokens, str):
+                    try:
+                        tokens = json.loads(tokens)
+                    except (json.JSONDecodeError, TypeError):
+                        tokens = []
+
+                # Also try CLOB API format: "tokens" list of objects
+                if not tokens or (isinstance(tokens, list) and len(tokens) < 2):
+                    token_objs = market.get("tokens", [])
+                    if isinstance(token_objs, list) and len(token_objs) >= 2:
+                        tokens = []
+                        for t in token_objs:
+                            if isinstance(t, dict):
+                                tokens.append(t.get("token_id", t.get("tokenId", "")))
+                            elif isinstance(t, str):
+                                tokens.append(t)
+
                 if not tokens or len(tokens) < 2:
+                    skipped_no_tokens += 1
                     continue
 
                 token_yes = tokens[0]
@@ -399,6 +437,7 @@ class MarketScanner:
 
                 # Check thin book condition
                 if not self._check_thin_book(book_yes) or not self._check_thin_book(book_no):
+                    skipped_thick_book += 1
                     log.debug(f"Skipping {condition_id[:16]}: book too thick")
                     continue
 
@@ -406,6 +445,7 @@ class MarketScanner:
                 yes_bids = book_yes.get("bids", [])
                 yes_asks = book_yes.get("asks", [])
                 if not yes_bids or not yes_asks:
+                    skipped_empty_book += 1
                     log.debug(f"Skipping {condition_id[:16]}: empty YES book")
                     continue
 
@@ -416,6 +456,7 @@ class MarketScanner:
                 no_bids = book_no.get("bids", [])
                 no_asks = book_no.get("asks", [])
                 if not no_bids or not no_asks:
+                    skipped_empty_book += 1
                     log.debug(f"Skipping {condition_id[:16]}: empty NO book")
                     continue
 
@@ -429,6 +470,7 @@ class MarketScanner:
 
                 # Filter: spread must be < MAX_SPREAD_GAP (5 cents)
                 if avg_spread > self.config.max_spread_gap:
+                    skipped_wide_spread += 1
                     log.debug(f"Skipping {condition_id[:16]}: spread too wide ({avg_spread:.4f})")
                     continue
 
@@ -443,6 +485,7 @@ class MarketScanner:
 
                 # Filter: we want at least MIN_REWARD_SHARE_TARGET
                 if share < self.config.min_reward_share_target:
+                    skipped_low_share += 1
                     log.debug(f"Skipping {condition_id[:16]}: reward share too low ({share:.1%})")
                     continue
 
@@ -486,5 +529,13 @@ class MarketScanner:
             reverse=True,
         )
 
-        log.info(f"Found {len(eligible)} eligible markets for LP")
+        log.info(
+            f"Scan results: {len(eligible)} eligible | "
+            f"Filtered out: {skipped_no_reward} no reward, "
+            f"{skipped_no_tokens} no tokens, "
+            f"{skipped_thick_book} thick book, "
+            f"{skipped_empty_book} empty book, "
+            f"{skipped_wide_spread} wide spread, "
+            f"{skipped_low_share} low share"
+        )
         return eligible
