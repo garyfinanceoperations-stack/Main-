@@ -78,29 +78,84 @@ class MarketScanner:
 
     def get_rewards_markets(self) -> list[dict]:
         """Fetch markets that have active reward pools."""
+        # Try multiple endpoints - Polymarket API evolves frequently
+
+        # Attempt 1: CLOB /markets with rewards included
+        try:
+            resp = self._session.get(
+                f"{self.clob_url}/markets",
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                data = data.get("data", data.get("markets", []))
+            if isinstance(data, list) and data:
+                rewarded = [m for m in data if self._has_rewards(m)]
+                if rewarded:
+                    log.info(f"Found {len(rewarded)} reward markets via CLOB /markets")
+                    return rewarded
+        except Exception as e:
+            log.debug(f"CLOB /markets: {e}")
+
+        # Attempt 2: CLOB /rewards/markets (legacy)
         try:
             resp = self._session.get(
                 f"{self.clob_url}/rewards/markets",
                 timeout=30,
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if data:
+                log.info(f"Found {len(data)} reward markets via CLOB /rewards/markets")
+                return data
         except Exception as e:
-            log.error(f"Error fetching rewards markets: {e}")
-            # Fallback: try the Gamma API rewards endpoint
-            try:
-                resp = self._session.get(
-                    f"{self.gamma_url}/markets",
-                    params={"active": True, "closed": False},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                # Filter to markets with reward fields
-                return [m for m in data if self._has_rewards(m)]
-            except Exception as e2:
-                log.error(f"Fallback rewards fetch also failed: {e2}")
-                return []
+            log.debug(f"CLOB /rewards/markets: {e}")
+
+        # Attempt 3: Gamma API - most reliable fallback
+        try:
+            resp = self._session.get(
+                f"{self.gamma_url}/markets",
+                params={
+                    "active": True,
+                    "closed": False,
+                    "limit": 200,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rewarded = [m for m in data if self._has_rewards(m)]
+            if rewarded:
+                log.info(f"Found {len(rewarded)} reward markets via Gamma API")
+                return rewarded
+            # If no rewarded markets found, return all active (user can filter)
+            log.warning("No reward fields found - returning all active markets")
+            return data
+        except Exception as e:
+            log.error(f"Gamma API also failed: {e}")
+
+        # Attempt 4: Gamma API events endpoint
+        try:
+            resp = self._session.get(
+                f"{self.gamma_url}/events",
+                params={"active": True, "closed": False, "limit": 100},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            events = resp.json()
+            markets = []
+            for event in events:
+                for m in event.get("markets", []):
+                    m["question"] = m.get("question", event.get("title", ""))
+                    markets.append(m)
+            if markets:
+                log.info(f"Found {len(markets)} markets via Gamma /events")
+                return markets
+        except Exception as e:
+            log.error(f"All market fetch attempts failed: {e}")
+
+        return []
 
     def _has_rewards(self, market: dict) -> bool:
         """Check if a market dictionary indicates it has active rewards."""
