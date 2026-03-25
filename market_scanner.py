@@ -460,24 +460,26 @@ class MarketScanner:
                         log.info(f"    {label} bids (top 3): {bids}")
                         log.info(f"    {label} asks (top 3): {asks}")
 
-                # Measure max depth per price level for diagnostics
-                # Use raw size (shares) not size*price since size may already be USD
-                max_level_depth = 0.0
+                # Measure max USD depth per price level for diagnostics
+                max_level_usd = 0.0
                 for book in [book_yes, book_no]:
                     for side in ["bids", "asks"]:
                         price_levels = {}
                         for order in book.get(side, []):
-                            price = order.get("price", "0")
+                            price = float(order.get("price", "0"))
                             size = float(order.get("size", 0))
-                            price_levels[price] = price_levels.get(price, 0) + size
+                            price_levels[str(price)] = price_levels.get(str(price), 0) + size * price
                         for d in price_levels.values():
-                            max_level_depth = max(max_level_depth, d)
-                depth_samples.append(max_level_depth)
+                            max_level_usd = max(max_level_usd, d)
+                depth_samples.append(max_level_usd)
 
-                # Log first 20 depth samples (now in raw shares)
+                is_thin = self._check_thin_book(book_yes) and self._check_thin_book(book_no)
+
+                # Log first 20 depth samples in USD
                 if len(depth_samples) <= 20:
                     question = market.get("question", market.get("title", "?"))[:50]
-                    log.info(f"  DEPTH: {max_level_depth:.0f} shares/level | limit: ${self.config.max_orderbook_depth:.0f} | {question}")
+                    status = "THIN" if is_thin else "THICK"
+                    log.info(f"  [{status}] ${max_level_usd:.2f}/level | limit: ${self.config.max_orderbook_depth:.0f} | {question}")
 
                 # Check thin book condition
                 if not self._check_thin_book(book_yes) or not self._check_thin_book(book_no):
