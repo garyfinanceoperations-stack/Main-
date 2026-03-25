@@ -389,6 +389,7 @@ class MarketScanner:
         skipped_low_share = 0
         checked_books = 0
         debug_logged = 0  # log details for first 10 thin-book markets
+        depth_samples = []  # collect depth values to show distribution
 
         for market in all_markets:
             try:
@@ -448,6 +449,24 @@ class MarketScanner:
                 # Log progress every 50 book checks
                 if checked_books % 50 == 0:
                     log.info(f"  ...checked {checked_books} order books so far, {len(eligible)} eligible...")
+
+                # Measure max depth per price level for diagnostics
+                max_level_depth = 0.0
+                for book in [book_yes, book_no]:
+                    for side in ["bids", "asks"]:
+                        price_levels = {}
+                        for order in book.get(side, []):
+                            price = order.get("price", "0")
+                            size = float(order.get("size", 0))
+                            price_levels[price] = price_levels.get(price, 0) + size * float(price)
+                        for d in price_levels.values():
+                            max_level_depth = max(max_level_depth, d)
+                depth_samples.append(max_level_depth)
+
+                # Log first 20 depth samples so user can see real values
+                if len(depth_samples) <= 20:
+                    question = market.get("question", market.get("title", "?"))[:50]
+                    log.info(f"  DEPTH: ${max_level_depth:.0f}/level | limit: ${self.config.max_orderbook_depth:.0f} | {question}")
 
                 # Check thin book condition
                 if not self._check_thin_book(book_yes) or not self._check_thin_book(book_no):
@@ -550,6 +569,19 @@ class MarketScanner:
             key=lambda m: m.our_share_estimate * m.reward_pool,
             reverse=True,
         )
+
+        # Show depth distribution so user can tune MAX_ORDERBOOK_DEPTH
+        if depth_samples:
+            depth_samples.sort()
+            p25 = depth_samples[len(depth_samples) // 4] if len(depth_samples) > 4 else 0
+            p50 = depth_samples[len(depth_samples) // 2] if len(depth_samples) > 2 else 0
+            p75 = depth_samples[3 * len(depth_samples) // 4] if len(depth_samples) > 4 else 0
+            lowest = depth_samples[0]
+            log.info(
+                f"  BOOK DEPTH STATS: lowest=${lowest:.0f} | "
+                f"25th=${p25:.0f} | median=${p50:.0f} | 75th=${p75:.0f} | "
+                f"current limit=${self.config.max_orderbook_depth:.0f}"
+            )
 
         log.info(
             f"Scan results: {len(eligible)} eligible | "
