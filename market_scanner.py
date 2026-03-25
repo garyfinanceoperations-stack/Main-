@@ -388,6 +388,7 @@ class MarketScanner:
         skipped_wide_spread = 0
         skipped_low_share = 0
         checked_books = 0
+        debug_logged = 0  # log details for first 10 thin-book markets
 
         for market in all_markets:
             try:
@@ -458,7 +459,6 @@ class MarketScanner:
                 yes_asks = book_yes.get("asks", [])
                 if not yes_bids or not yes_asks:
                     skipped_empty_book += 1
-                    log.debug(f"Skipping {condition_id[:16]}: empty YES book")
                     continue
 
                 yes_bid = float(yes_bids[0]["price"])
@@ -469,7 +469,6 @@ class MarketScanner:
                 no_asks = book_no.get("asks", [])
                 if not no_bids or not no_asks:
                     skipped_empty_book += 1
-                    log.debug(f"Skipping {condition_id[:16]}: empty NO book")
                     continue
 
                 no_bid = float(no_bids[0]["price"])
@@ -480,14 +479,6 @@ class MarketScanner:
                 no_spread = no_ask - no_bid
                 avg_spread = (yes_spread + no_spread) / 2
 
-                # Filter: spread must be < MAX_SPREAD_GAP (5 cents)
-                if avg_spread > self.config.max_spread_gap:
-                    skipped_wide_spread += 1
-                    log.debug(f"Skipping {condition_id[:16]}: spread too wide ({avg_spread:.4f})")
-                    continue
-
-                midpoint = (yes_bid + yes_ask) / 2
-
                 # Calculate book depth
                 depth_yes = self._calculate_book_depth(book_yes, "bids") + self._calculate_book_depth(book_yes, "asks")
                 depth_no = self._calculate_book_depth(book_no, "bids") + self._calculate_book_depth(book_no, "asks")
@@ -495,10 +486,29 @@ class MarketScanner:
                 # Estimate our reward share
                 share = self._estimate_reward_share(market, book_yes, book_no)
 
+                question = market.get("question", market.get("title", "Unknown"))[:60]
+
+                # Log details for first 10 markets that pass thin-book check
+                if debug_logged < 10:
+                    debug_logged += 1
+                    log.info(
+                        f"  THIN BOOK: {question} | "
+                        f"spread: {avg_spread:.4f} (max: {self.config.max_spread_gap:.4f}) | "
+                        f"share: {share:.1%} (min: {self.config.min_reward_share_target:.0%}) | "
+                        f"depth: ${depth_yes:.0f}+${depth_no:.0f} | "
+                        f"reward: ${reward_amount:.0f}"
+                    )
+
+                # Filter: spread must be < MAX_SPREAD_GAP (5 cents)
+                if avg_spread > self.config.max_spread_gap:
+                    skipped_wide_spread += 1
+                    continue
+
+                midpoint = (yes_bid + yes_ask) / 2
+
                 # Filter: we want at least MIN_REWARD_SHARE_TARGET
                 if share < self.config.min_reward_share_target:
                     skipped_low_share += 1
-                    log.debug(f"Skipping {condition_id[:16]}: reward share too low ({share:.1%})")
                     continue
 
                 volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
