@@ -450,7 +450,18 @@ class MarketScanner:
                 if checked_books % 50 == 0:
                     log.info(f"  ...checked {checked_books} order books so far, {len(eligible)} eligible...")
 
+                # Dump raw book for first market so we can see actual field values
+                if checked_books == 1:
+                    question = market.get("question", market.get("title", "?"))[:50]
+                    log.info(f"  RAW BOOK DUMP for: {question}")
+                    for label, book in [("YES", book_yes), ("NO", book_no)]:
+                        bids = book.get("bids", [])[:3]
+                        asks = book.get("asks", [])[:3]
+                        log.info(f"    {label} bids (top 3): {bids}")
+                        log.info(f"    {label} asks (top 3): {asks}")
+
                 # Measure max depth per price level for diagnostics
+                # Use raw size (shares) not size*price since size may already be USD
                 max_level_depth = 0.0
                 for book in [book_yes, book_no]:
                     for side in ["bids", "asks"]:
@@ -458,15 +469,15 @@ class MarketScanner:
                         for order in book.get(side, []):
                             price = order.get("price", "0")
                             size = float(order.get("size", 0))
-                            price_levels[price] = price_levels.get(price, 0) + size * float(price)
+                            price_levels[price] = price_levels.get(price, 0) + size
                         for d in price_levels.values():
                             max_level_depth = max(max_level_depth, d)
                 depth_samples.append(max_level_depth)
 
-                # Log first 20 depth samples so user can see real values
+                # Log first 20 depth samples (now in raw shares)
                 if len(depth_samples) <= 20:
                     question = market.get("question", market.get("title", "?"))[:50]
-                    log.info(f"  DEPTH: ${max_level_depth:.0f}/level | limit: ${self.config.max_orderbook_depth:.0f} | {question}")
+                    log.info(f"  DEPTH: {max_level_depth:.0f} shares/level | limit: ${self.config.max_orderbook_depth:.0f} | {question}")
 
                 # Check thin book condition
                 if not self._check_thin_book(book_yes) or not self._check_thin_book(book_no):
