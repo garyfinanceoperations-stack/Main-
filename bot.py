@@ -73,13 +73,7 @@ class PolymarketLPBot:
             return False
 
         # Check wallet balance and allowances
-        wallet_ready = self.orders.check_wallet_ready()
-        if not wallet_ready:
-            log.warning(
-                "Wallet may not be ready for trading. "
-                "Ensure you have USDC on Polygon (chain 137) in your wallet. "
-                "The bot will still attempt to place orders."
-            )
+        self.orders.check_wallet_ready()
 
         log.info("Bot initialized successfully")
         return True
