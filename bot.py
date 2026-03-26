@@ -350,6 +350,8 @@ def main():
                         help="Show current position status and exit")
     parser.add_argument("--cancel-all", action="store_true",
                         help="Cancel all open orders and exit")
+    parser.add_argument("--test-order", action="store_true",
+                        help="Quick test: find first eligible market and try to place one order")
     parser.add_argument("--learning", action="store_true",
                         help="Show learning engine status and exit")
     parser.add_argument("--unblacklist", type=str, default=None,
@@ -357,6 +359,73 @@ def main():
     args = parser.parse_args()
 
     config = BotConfig()
+
+    if args.test_order:
+        errors = config.validate()
+        if errors:
+            for err in errors:
+                log.error(f"Config error: {err}")
+            return
+        log.info("=== QUICK ORDER TEST ===")
+        risk = RiskManager(config)
+        orders = OrderManager(config, risk)
+        orders.check_wallet_ready()
+
+        # Find first eligible market quickly (check only 50 markets)
+        scanner = MarketScanner(config)
+        log.info("Scanning first 50 markets for a quick test...")
+        import requests
+        try:
+            resp = requests.get(f"{config.gamma_api_url}/markets", params={
+                "active": "true", "closed": "false", "limit": 50
+            }, timeout=10)
+            markets_data = resp.json()
+        except Exception as e:
+            log.error(f"Failed to fetch markets: {e}")
+            return
+
+        # Find one with valid tokens
+        test_market = None
+        for m in markets_data:
+            tokens = m.get("clobTokenIds")
+            if not tokens:
+                continue
+            import json as _json
+            if isinstance(tokens, str):
+                try:
+                    tokens = _json.loads(tokens)
+                except:
+                    continue
+            if len(tokens) >= 2:
+                cid = m.get("conditionId", m.get("condition_id", ""))
+                if cid:
+                    test_market = {"condition_id": cid, "tokens": tokens,
+                                   "question": m.get("question", "?")}
+                    break
+
+        if not test_market:
+            log.error("Could not find a test market")
+            return
+
+        log.info(f"Test market: {test_market['question'][:60]}")
+        log.info(f"Token YES: {test_market['tokens'][0][:20]}...")
+        log.info(f"Token NO:  {test_market['tokens'][1][:20]}...")
+
+        # Try to place a tiny $1 BUY order at $0.10 (will sit on book, unlikely to fill)
+        token_id = test_market["tokens"][0]
+        test_price = 0.10
+        test_size = 10.0  # 10 shares at $0.10 = $1
+        log.info(f"Placing test order: BUY 10 shares YES @ $0.10 (=$1.00)")
+        oid = orders.place_limit_order(token_id, "BUY", test_price, test_size,
+                                       test_market["condition_id"])
+        if oid:
+            log.info(f"ORDER SUCCESS! ID: {oid}")
+            log.info("Cancelling test order...")
+            orders.cancel_order(oid)
+            log.info("Test complete - orders are working!")
+        else:
+            log.error("Order failed - check errors above")
+        return
 
     if args.learning:
         learner = Learner(config)
