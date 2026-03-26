@@ -72,11 +72,14 @@ class PolymarketLPBot:
             log.error(f"Failed to initialize order manager: {e}")
             return False
 
-        # Check and set allowances
-        try:
-            self.orders.set_allowances()
-        except Exception as e:
-            log.warning(f"Allowance setup issue (may already be set): {e}")
+        # Check wallet balance and allowances
+        wallet_ready = self.orders.check_wallet_ready()
+        if not wallet_ready:
+            log.warning(
+                "Wallet may not be ready for trading. "
+                "Ensure you have USDC on Polygon (chain 137) in your wallet. "
+                "The bot will still attempt to place orders."
+            )
 
         log.info("Bot initialized successfully")
         return True
@@ -139,6 +142,12 @@ class PolymarketLPBot:
             try:
                 # Cancel existing orders for this market
                 self.orders.cancel_market_orders(market.condition_id)
+
+                # Reset open order tracking for clean re-quote
+                exposure = self.risk.exposures.get(market.condition_id)
+                if exposure:
+                    exposure.total_open_orders_usd = 0.0
+
                 time.sleep(0.2)
 
                 # Place fresh two-sided quotes with learned adjustments

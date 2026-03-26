@@ -135,9 +135,10 @@ class RiskManager:
 
         exposure = self.exposures.get(condition_id, MarketExposure(condition_id=condition_id))
 
-        # Check market-level exposure
+        # Check market-level exposure (with $0.50 tolerance for rounding)
         new_total = exposure.total_exposure + size_usd
-        if new_total > self.config.max_exposure_per_market:
+        limit = self.config.max_exposure_per_market + 0.50
+        if new_total > limit:
             return False, (
                 f"Would exceed market exposure limit: "
                 f"${new_total:.2f} > ${self.config.max_exposure_per_market:.2f}"
@@ -150,6 +151,18 @@ class RiskManager:
             return False, f"Would exceed portfolio limit: ${total_portfolio:.2f}"
 
         return True, "OK"
+
+    def register_pending_order(self, condition_id: str, cost_usd: float):
+        """Track a pending order's cost so subsequent orders see it."""
+        if condition_id not in self.exposures:
+            self.exposures[condition_id] = MarketExposure(condition_id=condition_id)
+        self.exposures[condition_id].total_open_orders_usd += cost_usd
+
+    def unregister_pending_order(self, condition_id: str, cost_usd: float):
+        """Remove a pending order's cost (e.g. on failure or cancel)."""
+        exposure = self.exposures.get(condition_id)
+        if exposure:
+            exposure.total_open_orders_usd = max(0, exposure.total_open_orders_usd - cost_usd)
 
     # === Position Tracking ===
 

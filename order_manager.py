@@ -59,17 +59,55 @@ class OrderManager:
     def set_allowances(self):
         """Approve USDC spending for the CTF Exchange if needed."""
         try:
-            for method in ["set_allowances", "update_allowances",
-                           "approve", "create_or_derive_api_creds"]:
-                if method == "create_or_derive_api_creds":
-                    continue  # already called in init
+            for method in ["set_allowances", "update_allowances", "approve"]:
                 if hasattr(self.client, method):
-                    getattr(self.client, method)()
-                    log.info(f"Allowances set via {method}()")
-                    return
+                    result = getattr(self.client, method)()
+                    log.info(f"Allowances set via {method}(): {result}")
+                    return True
             log.info("No allowance setter available - may already be approved via wallet")
+            return False
         except Exception as e:
             log.warning(f"Allowance setup issue (may already be set): {e}")
+            return False
+
+    def check_wallet_ready(self) -> bool:
+        """Check wallet balance and allowance, log results for debugging."""
+        ready = True
+
+        # Check balance
+        try:
+            balances = self.get_balances()
+            log.info(f"Wallet balances: {balances}")
+            if isinstance(balances, dict):
+                usdc = float(balances.get("USDC", balances.get("usdc", 0)))
+                if usdc < self.config.order_size:
+                    log.error(
+                        f"USDC balance too low: ${usdc:.2f}. "
+                        f"Need at least ${self.config.order_size:.2f}. "
+                        f"Deposit USDC on Polygon to your wallet."
+                    )
+                    ready = False
+                else:
+                    log.info(f"USDC balance: ${usdc:.2f}")
+        except Exception as e:
+            log.warning(f"Could not check balance (will attempt orders anyway): {e}")
+
+        # Check allowance
+        try:
+            allowance = self.get_allowance()
+            if allowance == 0:
+                log.warning("USDC allowance is 0 — attempting to set allowances...")
+                self.set_allowances()
+            elif allowance < self.config.order_size and allowance != float("inf"):
+                log.warning(
+                    f"USDC allowance (${allowance:.2f}) may be too low. "
+                    f"Attempting to increase..."
+                )
+                self.set_allowances()
+        except Exception as e:
+            log.warning(f"Allowance check issue: {e}")
+
+        return ready
 
     def get_open_orders(self) -> list[dict]:
         """Fetch all open orders for our account."""
@@ -83,7 +121,12 @@ class OrderManager:
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order."""
         try:
+            info = self.active_orders.get(order_id)
             self.client.cancel(order_id)
+            if info:
+                # Unregister the order cost from risk tracking
+                cost = info.get("cost_usd", info.get("price", 0) * info.get("size", 0))
+                self.risk.unregister_pending_order(info["condition_id"], cost)
             self.active_orders.pop(order_id, None)
             log.info(f"Cancelled order {order_id[:16]}")
             return True
@@ -94,6 +137,10 @@ class OrderManager:
     def cancel_all_orders(self) -> int:
         """Cancel all open orders. Returns count of cancelled orders."""
         try:
+            # Unregister all tracked order costs
+            for oid, info in self.active_orders.items():
+                cost = info.get("cost_usd", info.get("price", 0) * info.get("size", 0))
+                self.risk.unregister_pending_order(info["condition_id"], cost)
             self.client.cancel_all()
             count = len(self.active_orders)
             self.active_orders.clear()
@@ -106,14 +153,19 @@ class OrderManager:
     def cancel_market_orders(self, condition_id: str) -> int:
         """Cancel all orders for a specific market."""
         cancelled = 0
-        to_remove = []
-        for oid, info in self.active_orders.items():
-            if info.get("condition_id") == condition_id:
-                if self.cancel_order(oid):
-                    cancelled += 1
-                    to_remove.append(oid)
-        for oid in to_remove:
-            self.active_orders.pop(oid, None)
+        to_cancel = [
+            (oid, info) for oid, info in self.active_orders.items()
+            if info.get("condition_id") == condition_id
+        ]
+        for oid, info in to_cancel:
+            try:
+                self.client.cancel(oid)
+                cost = info.get("cost_usd", info.get("price", 0) * info.get("size", 0))
+                self.risk.unregister_pending_order(condition_id, cost)
+                self.active_orders.pop(oid, None)
+                cancelled += 1
+            except Exception as e:
+                log.error(f"Failed to cancel order {oid[:16]}: {e}")
         return cancelled
 
     def place_limit_order(self, token_id: str, side: str, price: float,
@@ -130,6 +182,9 @@ class OrderManager:
             log.warning(f"Order blocked by risk manager: {reason}")
             return None
 
+        # Register pending cost so the next order in the same cycle sees it
+        self.risk.register_pending_order(condition_id, cost_usd)
+
         try:
             order_args = OrderArgs(
                 price=price,
@@ -145,6 +200,8 @@ class OrderManager:
                 order_id = resp.get("orderID", resp.get("id"))
                 if resp.get("success") is False:
                     log.warning(f"Order rejected: {resp.get('errorMsg', 'unknown')}")
+                    # Unregister since order didn't go through
+                    self.risk.unregister_pending_order(condition_id, cost_usd)
                     return None
             elif isinstance(resp, str):
                 order_id = resp
@@ -156,16 +213,22 @@ class OrderManager:
                     "side": side,
                     "price": price,
                     "size": size,
+                    "cost_usd": cost_usd,
                     "timestamp": time.time(),
                 }
                 log.info(
                     f"ORDER PLACED: {side} {size:.2f} @ ${price:.4f} "
-                    f"token={token_id[:16]}... | id={order_id[:16] if order_id else 'N/A'}"
+                    f"(${cost_usd:.2f}) token={token_id[:16]}... | id={order_id[:16] if order_id else 'N/A'}"
                 )
+            else:
+                # No order_id returned - unregister
+                self.risk.unregister_pending_order(condition_id, cost_usd)
             return order_id
 
         except Exception as e:
             log.error(f"Failed to place order: {e}")
+            # Unregister since order failed
+            self.risk.unregister_pending_order(condition_id, cost_usd)
             return None
 
     def place_lp_quotes(self, market: MarketInfo,
@@ -216,6 +279,11 @@ class OrderManager:
             # For fallback: use minimum size to limit exposure
             if market.is_fallback:
                 level_size = max(market.min_size, 5.0)
+
+            # Cap level_size so both sides fit within exposure limit
+            max_per_side = self.config.max_exposure_per_market / 2
+            if level_size > max_per_side:
+                level_size = max_per_side
 
             # === YES side ===
             if use_undercut and market.yes_bid > 0:
