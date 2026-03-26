@@ -2,7 +2,7 @@
 
 import time
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from config import BotConfig
@@ -44,7 +44,8 @@ class OrderManager:
         """Check balance and allowance using Polymarket's actual method."""
         try:
             if hasattr(self.client, "get_balance_allowance"):
-                result = self.client.get_balance_allowance()
+                params = BalanceAllowanceParams()
+                result = self.client.get_balance_allowance(params)
                 log.info(f"Balance/allowance: {result}")
                 return result if isinstance(result, dict) else {}
         except Exception as e:
@@ -55,7 +56,8 @@ class OrderManager:
         """Approve USDC spending for the CTF Exchange."""
         try:
             if hasattr(self.client, "update_balance_allowance"):
-                result = self.client.update_balance_allowance()
+                params = BalanceAllowanceParams()
+                result = self.client.update_balance_allowance(params)
                 log.info(f"update_balance_allowance() returned: {result}")
                 return True
         except Exception as e:
@@ -69,11 +71,11 @@ class OrderManager:
         ba = self.get_balance_and_allowance()
 
         # Step 2: Try to update/approve allowance
-        log.info("Setting allowance approval for CTF Exchange...")
-        self.update_balance_and_allowance()
-
-        # Step 3: Re-check after approval
-        ba = self.get_balance_and_allowance()
+        if not ba or float(ba.get("allowance", 0)) == 0:
+            log.info("Setting allowance approval for CTF Exchange...")
+            self.update_balance_and_allowance()
+            # Re-check after approval
+            ba = self.get_balance_and_allowance()
 
         if ba:
             log.info(f"Wallet status: {ba}")
