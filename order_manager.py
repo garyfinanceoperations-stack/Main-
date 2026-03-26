@@ -25,11 +25,24 @@ class OrderManager:
     def _initialize_client(self):
         """Initialize the CLOB client with authentication."""
         try:
-            self.client = ClobClient(
-                self.config.clob_api_url,
-                key=self.config.private_key,
-                chain_id=self.config.chain_id,
-            )
+            # Build client kwargs
+            kwargs = {
+                "host": self.config.clob_api_url,
+                "key": self.config.private_key,
+                "chain_id": self.config.chain_id,
+            }
+
+            # Add proxy wallet support if configured
+            if self.config.funder:
+                kwargs["funder"] = self.config.funder
+                log.info(f"Using proxy wallet (funder): {self.config.funder}")
+
+            if self.config.signature_type > 0:
+                kwargs["signature_type"] = self.config.signature_type
+                sig_names = {0: "EOA", 1: "Poly Proxy", 2: "Gnosis Safe"}
+                log.info(f"Signature type: {sig_names.get(self.config.signature_type, self.config.signature_type)}")
+
+            self.client = ClobClient(**kwargs)
 
             # Create or derive API credentials
             self.api_creds = self.client.create_or_derive_api_creds()

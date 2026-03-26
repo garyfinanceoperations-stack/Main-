@@ -15,6 +15,12 @@ class BotConfig:
     gamma_api_url: str = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com")
     chain_id: int = int(os.getenv("CHAIN_ID", "137"))
 
+    # Proxy wallet support (for using Polymarket deposit balance)
+    # FUNDER = your Polymarket proxy wallet address (find in polymarket.com profile)
+    # SIGNATURE_TYPE: 0=EOA (direct wallet), 1=Poly Proxy (email login), 2=Gnosis Safe (MetaMask)
+    funder: str = os.getenv("FUNDER", "")
+    signature_type: int = int(os.getenv("SIGNATURE_TYPE", "0"))
+
     # Risk limits
     max_exposure_per_market: float = float(os.getenv("MAX_EXPOSURE_PER_MARKET", "120"))
     max_loss_per_position: float = float(os.getenv("MAX_LOSS_PER_POSITION", "10"))
