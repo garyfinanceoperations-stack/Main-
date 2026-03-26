@@ -2,7 +2,7 @@
 
 import time
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams
+from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from config import BotConfig
@@ -41,10 +41,10 @@ class OrderManager:
             raise
 
     def get_balance_and_allowance(self) -> dict:
-        """Check balance and allowance using Polymarket's actual method."""
+        """Check USDC balance and allowance for the CTF Exchange."""
         try:
             if hasattr(self.client, "get_balance_allowance"):
-                params = BalanceAllowanceParams()
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
                 result = self.client.get_balance_allowance(params)
                 log.info(f"Balance/allowance: {result}")
                 return result if isinstance(result, dict) else {}
@@ -56,7 +56,7 @@ class OrderManager:
         """Approve USDC spending for the CTF Exchange."""
         try:
             if hasattr(self.client, "update_balance_allowance"):
-                params = BalanceAllowanceParams()
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
                 result = self.client.update_balance_allowance(params)
                 log.info(f"update_balance_allowance() returned: {result}")
                 return True
