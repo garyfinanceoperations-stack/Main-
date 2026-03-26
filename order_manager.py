@@ -40,70 +40,48 @@ class OrderManager:
             log.error(f"Failed to initialize CLOB client: {e}")
             raise
 
-    def get_allowance(self) -> float:
-        """Check USDC allowance for the CTF Exchange."""
+    def get_balance_and_allowance(self) -> dict:
+        """Check balance and allowance using Polymarket's actual method."""
         try:
-            for method in ["get_allowances", "get_allowance"]:
-                if hasattr(self.client, method):
-                    result = getattr(self.client, method)()
-                    log.info(f"Current allowances: {result}")
-                    if isinstance(result, dict):
-                        return float(result.get("allowance", 0))
-                    return float(result)
-            log.info("No allowance check method available - skipping")
-            return float("inf")
+            if hasattr(self.client, "get_balance_allowance"):
+                result = self.client.get_balance_allowance()
+                log.info(f"Balance/allowance: {result}")
+                return result if isinstance(result, dict) else {}
         except Exception as e:
-            log.warning(f"Could not check allowances: {e}")
-            return 0
+            log.warning(f"get_balance_allowance() error: {e}")
+        return {}
 
-    def set_allowances(self):
-        """Approve USDC spending for the CTF Exchange if needed."""
+    def update_balance_and_allowance(self) -> bool:
+        """Approve USDC spending for the CTF Exchange."""
         try:
-            for method in ["set_allowances", "update_allowances", "approve"]:
-                if hasattr(self.client, method):
-                    result = getattr(self.client, method)()
-                    log.info(f"Allowances set via {method}(): {result}")
-                    return True
-            log.info("No allowance setter available - may already be approved via wallet")
-            return False
+            if hasattr(self.client, "update_balance_allowance"):
+                result = self.client.update_balance_allowance()
+                log.info(f"update_balance_allowance() returned: {result}")
+                return True
         except Exception as e:
-            log.warning(f"Allowance setup issue (may already be set): {e}")
-            return False
+            log.warning(f"update_balance_allowance() error: {e}")
+        return False
 
     def check_wallet_ready(self) -> bool:
         """Check wallet balance and allowance, log results for debugging."""
-        # Log available client methods for debugging allowance issues
-        client_methods = [m for m in dir(self.client) if not m.startswith("_")]
-        allowance_related = [m for m in client_methods if any(
-            kw in m.lower() for kw in ["allow", "approv", "balance", "deposit"]
-        )]
-        log.info(f"CLOB client methods (allowance/balance related): {allowance_related}")
+        # Step 1: Check current balance and allowance
+        log.info("Checking wallet balance and allowance...")
+        ba = self.get_balance_and_allowance()
 
-        # Try to check balance (may return empty for proxy wallets - that's OK)
-        try:
-            balances = self.get_balances()
-            if balances:
-                log.info(f"Wallet balances: {balances}")
-            else:
-                log.info(
-                    "Balance check returned empty — this is normal for Polymarket proxy wallets. "
-                    "If you can trade on polymarket.com, your funds are available."
-                )
-        except Exception as e:
-            log.info(f"Balance check not available: {e}")
+        # Step 2: Try to update/approve allowance
+        log.info("Setting allowance approval for CTF Exchange...")
+        self.update_balance_and_allowance()
 
-        # Try every possible allowance/approval method
-        try:
-            for method in allowance_related:
-                if "set" in method.lower() or "approv" in method.lower() or "update" in method.lower():
-                    try:
-                        log.info(f"Trying allowance method: {method}()")
-                        result = getattr(self.client, method)()
-                        log.info(f"  -> {method}() returned: {result}")
-                    except Exception as e:
-                        log.debug(f"  -> {method}() failed: {e}")
-        except Exception as e:
-            log.warning(f"Allowance setup issue: {e}")
+        # Step 3: Re-check after approval
+        ba = self.get_balance_and_allowance()
+
+        if ba:
+            log.info(f"Wallet status: {ba}")
+        else:
+            log.info(
+                "Could not read balance/allowance (normal for some setups). "
+                "If you can trade on polymarket.com, your funds should work."
+            )
 
         log.info("Wallet check complete — will attempt to place orders.")
         return True
