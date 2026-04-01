@@ -451,8 +451,13 @@ def main():
             return
         risk = RiskManager(config)
         orders = OrderManager(config, risk)
-        orders.cancel_all_orders()
-        log.info("All orders cancelled.")
+        # Cancel all via API (catches orders the bot may not be tracking)
+        try:
+            orders.client.cancel_all()
+            log.info("All open orders cancelled via API.")
+        except Exception as e:
+            log.error(f"cancel_all error: {e}")
+        orders.active_orders.clear()
         return
 
     bot = PolymarketLPBot(config, dry_run=args.dry_run)

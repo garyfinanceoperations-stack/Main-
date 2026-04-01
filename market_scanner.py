@@ -458,7 +458,7 @@ class MarketScanner:
         log.info(f"Scanning {len(all_markets)} markets...")
 
         stats = {
-            "no_tokens": 0, "bad_midpoint": 0, "too_thick": 0,
+            "no_tokens": 0, "no_reward": 0, "bad_midpoint": 0, "too_thick": 0,
             "bad_spread": 0, "low_share": 0, "checked": 0,
             "fallback": 0,
         }
@@ -475,15 +475,11 @@ class MarketScanner:
                 condition_id = market.get("conditionId", market.get("condition_id", ""))
                 question = market.get("question", market.get("title", "Unknown"))[:80]
 
-                # Reward amount - use API data or estimate
+                # Reward amount - ONLY use actual API data, don't guess
                 reward_amount = self._get_reward_amount(market)
-                if reward_amount == 0:
-                    liquidity = float(market.get("liquidity", 0) or 0)
-                    volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
-                    if liquidity > 0 or volume > 0:
-                        reward_amount = max(10.0, liquidity * 0.01, volume * 0.005)
-                    else:
-                        reward_amount = 20.0  # assume minimum for unknown markets
+                if reward_amount < self.config.min_reward_pool:
+                    stats["no_reward"] += 1
+                    continue
 
                 # Fetch order books
                 book_yes = self.get_orderbook(token_yes)
@@ -666,6 +662,7 @@ class MarketScanner:
         log.info(
             f"Scan: {len(eligible)} eligible ({stats['fallback']} fallback) | "
             f"Skipped: {stats['no_tokens']} no tokens, "
+            f"{stats['no_reward']} no/low reward, "
             f"{stats['bad_midpoint']} bad midpoint, "
             f"{stats['too_thick']} too thick, "
             f"{stats['bad_spread']} bad spread | "
