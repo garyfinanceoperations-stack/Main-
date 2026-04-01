@@ -193,6 +193,21 @@ class MarketScanner:
 
     def _get_reward_amount(self, market: dict) -> float:
         """Extract the daily reward amount from a market dict."""
+        total = 0.0
+
+        # Gamma API: clobRewards array (most reliable source)
+        clob_rewards = market.get("clobRewards", [])
+        if isinstance(clob_rewards, list):
+            for entry in clob_rewards:
+                if isinstance(entry, dict):
+                    rate = entry.get("rewardsDailyRate", 0)
+                    try:
+                        total += float(rate)
+                    except (ValueError, TypeError):
+                        pass
+        if total > 0:
+            return total
+
         # CLOB API: nested rewards.rates structure
         rewards_obj = market.get("rewards", {})
         if isinstance(rewards_obj, dict):
@@ -205,19 +220,42 @@ class MarketScanner:
                 except (ValueError, TypeError):
                     pass
 
-        # Gamma API flat fields
+        # Flat field fallbacks
         for key in ["rewardsDaily", "rewards_daily_rate",
-                     "rewardsDailyRate", "liquidityRewards", "rewardsAmount"]:
+                     "rewardsDailyRate", "liquidityRewards"]:
             val = market.get(key)
             if val:
                 try:
-                    return float(val)
+                    v = float(val)
+                    if v > 0:
+                        return v
                 except (ValueError, TypeError):
                     continue
+
+        # If market has rewardsMinSize and rewardsMaxSpread set, it likely has rewards
+        min_size = market.get("rewardsMinSize")
+        max_spread = market.get("rewardsMaxSpread")
+        if min_size and max_spread:
+            try:
+                if float(min_size) > 0 and float(max_spread) > 0:
+                    return 1.0  # has rewards but unknown amount
+            except (ValueError, TypeError):
+                pass
+
         return 0.0
 
     def _get_max_spread(self, market: dict) -> float:
         """Get the max spread for reward eligibility."""
+        # Gamma API flat field (most common)
+        val = market.get("rewardsMaxSpread")
+        if val:
+            try:
+                v = float(val)
+                if v > 0:
+                    return v / 100 if v > 1 else v  # normalize: 3.5 -> 0.035
+            except (ValueError, TypeError):
+                pass
+
         # CLOB API nested
         rewards_obj = market.get("rewards", {})
         if isinstance(rewards_obj, dict):
@@ -225,20 +263,23 @@ class MarketScanner:
                 val = rewards_obj.get(key)
                 if val:
                     try:
-                        return float(val)
+                        v = float(val)
+                        if v > 0:
+                            return v / 100 if v > 1 else v
                     except (ValueError, TypeError):
                         pass
 
         # Flat field fallbacks
-        for key in ["rewardsMaxSpread", "rewards_max_spread",
-                     "maxIncentiveSpread", "max_incentive_spread"]:
+        for key in ["rewards_max_spread", "maxIncentiveSpread", "max_incentive_spread"]:
             val = market.get(key)
             if val:
                 try:
-                    return float(val)
+                    v = float(val)
+                    if v > 0:
+                        return v / 100 if v > 1 else v
                 except (ValueError, TypeError):
                     continue
-        return 0.03  # default 3 cents
+        return 0.035  # default 3.5 cents
 
     def _get_min_size(self, market: dict) -> float:
         """Get the minimum order size for reward eligibility."""
@@ -475,9 +516,9 @@ class MarketScanner:
                 condition_id = market.get("conditionId", market.get("condition_id", ""))
                 question = market.get("question", market.get("title", "Unknown"))[:80]
 
-                # Reward amount - ONLY use actual API data, don't guess
+                # Reward amount - ONLY use actual API data
                 reward_amount = self._get_reward_amount(market)
-                if reward_amount < self.config.min_reward_pool:
+                if reward_amount <= 0:
                     stats["no_reward"] += 1
                     continue
 
