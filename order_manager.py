@@ -24,34 +24,42 @@ class OrderManager:
 
     def _initialize_client(self):
         """Initialize the CLOB client with authentication."""
-        try:
-            # Build client kwargs
-            kwargs = {
-                "host": self.config.clob_api_url,
-                "key": self.config.private_key,
-                "chain_id": self.config.chain_id,
-            }
+        # Build client kwargs
+        kwargs = {
+            "host": self.config.clob_api_url,
+            "key": self.config.private_key,
+            "chain_id": self.config.chain_id,
+        }
 
-            # Add proxy wallet support if configured
-            if self.config.funder:
-                kwargs["funder"] = self.config.funder
-                log.info(f"Using proxy wallet (funder): {self.config.funder}")
+        # Add proxy wallet support if configured
+        if self.config.funder:
+            kwargs["funder"] = self.config.funder
+            log.info(f"Using proxy wallet (funder): {self.config.funder}")
 
-            if self.config.signature_type > 0:
-                kwargs["signature_type"] = self.config.signature_type
-                sig_names = {0: "EOA", 1: "Poly Proxy", 2: "Gnosis Safe"}
-                log.info(f"Signature type: {sig_names.get(self.config.signature_type, self.config.signature_type)}")
+        if self.config.signature_type > 0:
+            kwargs["signature_type"] = self.config.signature_type
+            sig_names = {0: "EOA", 1: "Poly Proxy", 2: "Gnosis Safe"}
+            log.info(f"Signature type: {sig_names.get(self.config.signature_type, self.config.signature_type)}")
 
-            self.client = ClobClient(**kwargs)
+        self.client = ClobClient(**kwargs)
 
-            # Create or derive API credentials
-            self.api_creds = self.client.create_or_derive_api_creds()
-            self.client.set_api_creds(self.api_creds)
-            log.info(f"CLOB client initialized for chain {self.config.chain_id}")
-
-        except Exception as e:
-            log.error(f"Failed to initialize CLOB client: {e}")
-            raise
+        # Create or derive API credentials with retry
+        max_retries = 4
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.api_creds = self.client.create_or_derive_api_creds()
+                self.client.set_api_creds(self.api_creds)
+                log.info(f"CLOB client initialized for chain {self.config.chain_id}")
+                return
+            except Exception as e:
+                wait = 2 ** attempt  # 2, 4, 8, 16 seconds
+                log.warning(f"API connection attempt {attempt}/{max_retries} failed: {e}")
+                if attempt < max_retries:
+                    log.info(f"Retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    log.error(f"Failed to connect after {max_retries} attempts. Check your internet and try again.")
+                    raise
 
     def get_balance_and_allowance(self) -> dict:
         """Check USDC balance and allowance for the CTF Exchange."""
