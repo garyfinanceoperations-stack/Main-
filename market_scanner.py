@@ -3,6 +3,7 @@
 import json
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from config import BotConfig
 from logger import log
@@ -496,40 +497,61 @@ class MarketScanner:
             log.warning("No reward markets found, trying full market list")
             all_markets = self.get_all_markets()
 
-        log.info(f"Scanning {len(all_markets)} markets...")
-
+        # Pre-filter: only keep markets with rewards and valid tokens (no API calls needed)
+        candidates = []
         stats = {
             "no_tokens": 0, "no_reward": 0, "bad_midpoint": 0, "too_thick": 0,
             "bad_spread": 0, "low_share": 0, "checked": 0,
-            "fallback": 0,
+            "fallback": 0, "total": len(all_markets),
         }
 
         for market in all_markets:
-            try:
-                tokens = self._get_tokens(market)
-                if not tokens:
-                    stats["no_tokens"] += 1
-                    continue
+            tokens = self._get_tokens(market)
+            if not tokens:
+                stats["no_tokens"] += 1
+                continue
+            reward_amount = self._get_reward_amount(market)
+            if reward_amount <= 0:
+                stats["no_reward"] += 1
+                continue
+            candidates.append((market, tokens, reward_amount))
 
+        log.info(
+            f"Pre-filter: {len(candidates)} markets with rewards "
+            f"(skipped {stats['no_tokens']} no tokens, {stats['no_reward']} no reward) "
+            f"out of {stats['total']} total"
+        )
+
+        # Fetch order books in parallel batches for speed
+        def _fetch_books(item):
+            market, tokens, reward = item
+            book_yes = self.get_orderbook(tokens[0])
+            book_no = self.get_orderbook(tokens[1])
+            return (market, tokens, reward, book_yes, book_no)
+
+        fetched = []
+        BATCH_SIZE = 8
+        for i in range(0, len(candidates), BATCH_SIZE):
+            batch = candidates[i:i + BATCH_SIZE]
+            with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
+                futures = [pool.submit(_fetch_books, item) for item in batch]
+                for f in as_completed(futures):
+                    try:
+                        fetched.append(f.result())
+                    except Exception:
+                        pass
+            stats["checked"] += len(batch)
+            if stats["checked"] % 50 == 0 or i + BATCH_SIZE >= len(candidates):
+                log.info(f"  ...fetched {stats['checked']}/{len(candidates)} books...")
+
+        log.info(f"Scanning {len(fetched)} markets with book data...")
+
+        for market, tokens, reward_amount, book_yes, book_no in fetched:
+            try:
                 token_yes = tokens[0]
                 token_no = tokens[1]
                 condition_id = market.get("conditionId", market.get("condition_id", ""))
                 question = market.get("question", market.get("title", "Unknown"))[:80]
-
-                # Reward amount - ONLY use actual API data
-                reward_amount = self._get_reward_amount(market)
-                if reward_amount <= 0:
-                    stats["no_reward"] += 1
-                    continue
-
-                # Fetch order books
-                book_yes = self.get_orderbook(token_yes)
-                book_no = self.get_orderbook(token_no)
-                stats["checked"] += 1
-                time.sleep(0.15)
-
-                if stats["checked"] % 100 == 0:
-                    log.info(f"  ...checked {stats['checked']} books, {len(eligible)} eligible...")
 
                 # === RULE 1: Determine midpoint ===
                 yes_bids = book_yes.get("bids", [])
