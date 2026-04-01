@@ -27,9 +27,12 @@ from learner import Learner
 class PolymarketLPBot:
     """Main bot orchestrator."""
 
-    def __init__(self, config: BotConfig, dry_run: bool = False):
+    def __init__(self, config: BotConfig, dry_run: bool = False, spending_cap: float = 0):
         self.config = config
         self.dry_run = dry_run
+        self.spending_cap = spending_cap  # 0 = no cap
+        self.total_spent = 0.0  # tracks total USD committed to orders
+        self.cap_reached = False
         self.running = False
         self.scanner = MarketScanner(config)
         self.risk = RiskManager(config)
@@ -159,6 +162,21 @@ class PolymarketLPBot:
             except Exception as e:
                 log.error(f"Error refreshing quotes for {market.condition_id[:16]}: {e}")
 
+    def _update_spending(self):
+        """Track total USD in open orders and check against spending cap."""
+        if self.spending_cap <= 0 or not self.orders:
+            return
+        self.total_spent = sum(
+            info.get("cost_usd", info.get("price", 0) * info.get("size", 0))
+            for info in self.orders.active_orders.values()
+        )
+        if self.total_spent >= self.spending_cap:
+            self.cap_reached = True
+            log.info(
+                f"SPENDING CAP REACHED: ${self.total_spent:.2f} / ${self.spending_cap:.2f} in open orders. "
+                f"No more orders will be placed. Monitoring positions and risk."
+            )
+
     def check_risk_and_act(self):
         """Run risk checks and execute any required actions."""
         if self.dry_run or not self.orders:
@@ -252,6 +270,9 @@ class PolymarketLPBot:
         scan_counter = 0
         FULL_SCAN_EVERY = 10  # full market re-scan every 10 cycles
 
+        if self.spending_cap > 0:
+            log.info(f"LIVE TEST MODE: max ${self.spending_cap:.2f} in orders, then monitor only")
+
         log.info("Bot is now running. Press Ctrl+C to stop.")
         log.info(f"Scan interval: {self.config.scan_interval}s")
 
@@ -259,34 +280,42 @@ class PolymarketLPBot:
             try:
                 cycle_start = time.time()
 
-                # Full market scan periodically
-                if scan_counter % FULL_SCAN_EVERY == 0:
-                    log.info("--- Full market scan ---")
-                    markets = self.scan_and_select_markets()
-                    if markets:
-                        self.refresh_quotes(markets)
+                # Only place new orders if cap not reached
+                if not self.cap_reached:
+                    # Full market scan periodically
+                    if scan_counter % FULL_SCAN_EVERY == 0:
+                        log.info("--- Full market scan ---")
+                        markets = self.scan_and_select_markets()
+                        if markets:
+                            self.refresh_quotes(markets)
+                            # Track spending
+                            self._update_spending()
+                    else:
+                        # Quick refresh: just update quotes for existing markets
+                        existing = [
+                            info["market"]
+                            for info in self.active_markets.values()
+                        ]
+                        if existing:
+                            # Re-fetch book data for existing markets
+                            refreshed = []
+                            for m in existing:
+                                book_yes = self.scanner.get_orderbook(m.token_yes)
+                                book_no = self.scanner.get_orderbook(m.token_no)
+                                yes_bids = book_yes.get("bids", [])
+                                yes_asks = book_yes.get("asks", [])
+                                if yes_bids and yes_asks:
+                                    m.yes_bid = float(yes_bids[0]["price"])
+                                    m.yes_ask = float(yes_asks[0]["price"])
+                                    m.midpoint = (m.yes_bid + m.yes_ask) / 2
+                                    m.spread = m.yes_ask - m.yes_bid
+                                refreshed.append(m)
+                                time.sleep(0.1)
+                            self.refresh_quotes(refreshed)
+                            self._update_spending()
                 else:
-                    # Quick refresh: just update quotes for existing markets
-                    existing = [
-                        info["market"]
-                        for info in self.active_markets.values()
-                    ]
-                    if existing:
-                        # Re-fetch book data for existing markets
-                        refreshed = []
-                        for m in existing:
-                            book_yes = self.scanner.get_orderbook(m.token_yes)
-                            book_no = self.scanner.get_orderbook(m.token_no)
-                            yes_bids = book_yes.get("bids", [])
-                            yes_asks = book_yes.get("asks", [])
-                            if yes_bids and yes_asks:
-                                m.yes_bid = float(yes_bids[0]["price"])
-                                m.yes_ask = float(yes_asks[0]["price"])
-                                m.midpoint = (m.yes_bid + m.yes_ask) / 2
-                                m.spread = m.yes_ask - m.yes_bid
-                            refreshed.append(m)
-                            time.sleep(0.1)
-                        self.refresh_quotes(refreshed)
+                    if scan_counter % 5 == 0:
+                        log.info(f"Spending cap reached (${self.total_spent:.2f}/${self.spending_cap:.2f}) - monitoring only, no new orders")
 
                 # Always run risk checks
                 self.check_risk_and_act()
@@ -352,6 +381,9 @@ def main():
                         help="Cancel all open orders and exit")
     parser.add_argument("--test-order", action="store_true",
                         help="Quick test: find first eligible market and try to place one order")
+    parser.add_argument("--live-test", action="store_true",
+                        help="Live test: place up to $10 in orders, then stop placing new ones. "
+                             "Keeps running to monitor fills and manage risk.")
     parser.add_argument("--learning", action="store_true",
                         help="Show learning engine status and exit")
     parser.add_argument("--unblacklist", type=str, default=None,
@@ -460,7 +492,19 @@ def main():
         orders.active_orders.clear()
         return
 
-    bot = PolymarketLPBot(config, dry_run=args.dry_run)
+    if args.live_test:
+        # Override config for safe $10 test
+        config.order_size = 5.0
+        config.num_price_levels = 1
+        config.max_active_markets = 1
+        config.max_exposure_per_market = 10.0
+        config.max_loss_per_position = 3.0
+        config.emergency_loss_threshold = 5.0
+        config.portfolio_stop_loss = 10.0
+        log.info("LIVE TEST: $10 cap | $5/order | 1 market | $3 max loss | $10 stop-loss")
+        bot = PolymarketLPBot(config, spending_cap=10.0)
+    else:
+        bot = PolymarketLPBot(config, dry_run=args.dry_run)
     bot.run()
 
 
