@@ -518,6 +518,15 @@ class MarketScanner:
             if reward_amount <= 0:
                 stats["no_reward"] += 1
                 continue
+            # Skip markets where min shares requirement exceeds our budget
+            # min_size is in shares; at ~$0.50/share, check if we can afford it
+            min_shares = self._get_min_size(market)
+            min_usd_needed = min_shares * 0.50  # approximate cost at midpoint
+            if min_usd_needed > self.config.max_exposure_per_market:
+                stats["no_reward"] += 1  # reuse counter
+                log.debug(f"Skipping {market.get('question', '?')[:40]}: "
+                          f"min_size={min_shares:.0f} shares (~${min_usd_needed:.0f}) > budget")
+                continue
             candidates.append((market, tokens, reward_amount))
 
         log.info(

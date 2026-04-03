@@ -445,14 +445,15 @@ def run_simulation(config: BotConfig):
                 continue
 
             size_multiplier = 1.0 - (level * 0.15)
-            level_size = config.order_size * size_multiplier
-            if level_size < m.min_size:
-                level_size = m.min_size
-            if m.is_fallback:
-                level_size = max(m.min_size, 5.0)
+            base_usd = config.order_size * size_multiplier
+            # min_size is in SHARES — calculate USD needed to meet it
+            min_usd_for_shares = m.min_size * midpoint
+            level_size = max(base_usd, min_usd_for_shares)
             max_per_side = config.max_exposure_per_market / 2
             if level_size > max_per_side:
                 level_size = max_per_side
+                log.info(f"      Capped at ${level_size:.2f}/side. "
+                         f"Need ${min_usd_for_shares:.2f} for {m.min_size:.0f} min shares.")
 
             # YES side price
             if use_undercut and m.yes_bid > 0 and abs(m.yes_bid - midpoint) <= 0.15:

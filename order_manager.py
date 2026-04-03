@@ -270,20 +270,19 @@ class OrderManager:
 
             # Size decreases slightly for levels further from mid
             size_multiplier = 1.0 - (level * 0.15)
-            level_size = self.config.order_size * size_multiplier * size_mult
+            base_usd = self.config.order_size * size_multiplier * size_mult
 
-            # Ensure we meet minimum size requirement
-            if level_size < market.min_size:
-                level_size = market.min_size
-
-            # For fallback: use minimum size to limit exposure
-            if market.is_fallback:
-                level_size = max(market.min_size, 5.0)
+            # min_size from rewards is in SHARES, not USD
+            # Calculate the minimum USD needed to meet min_size shares at ~midpoint price
+            min_usd_for_shares = market.min_size * midpoint
+            level_size = max(base_usd, min_usd_for_shares)
 
             # Cap level_size so both sides fit within exposure limit
             max_per_side = self.config.max_exposure_per_market / 2
             if level_size > max_per_side:
                 level_size = max_per_side
+                log.info(f"  Note: capped at ${level_size:.2f}/side (exposure limit). "
+                         f"Need ${min_usd_for_shares:.2f} for {market.min_size:.0f} min shares.")
 
             # === YES side ===
             if use_undercut and market.yes_bid > 0:
