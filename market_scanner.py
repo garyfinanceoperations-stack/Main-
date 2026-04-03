@@ -81,129 +81,124 @@ class MarketScanner:
 
     def get_rewards_markets(self) -> list[dict]:
         """
-        Fetch markets that have ACTIVE liquidity rewards from the CLOB API.
-        The CLOB /markets endpoint is the authoritative source — it returns
-        a 'rewards' object with 'rates', 'max_spread', 'min_size'.
-        Only markets where rewards.rates is non-null/non-empty are on the
-        Polymarket rewards page.
-        """
-        # CLOB API /markets is paginated with next_cursor
-        clob_markets = {}  # condition_id -> market dict
-        next_cursor = "MA=="
-        page = 0
+        Fetch markets with ACTIVE liquidity rewards.
 
-        while True:
+        Strategy:
+        1. Gamma API /markets (fast, paginated with offset) — get all active markets
+        2. For each market with tokens, fetch CLOB /markets/{condition_id} to get
+           authoritative reward data (rewards.rates, max_spread, min_size)
+        3. Only keep markets where rewards.rates is populated (= on rewards page)
+
+        This avoids the slow/huge CLOB /markets bulk endpoint.
+        """
+        # Step 1: Fetch all active markets from Gamma (fast)
+        gamma_markets = {}
+        offset = 0
+        while offset < 800:
             try:
                 resp = self._session.get(
-                    f"{self.clob_url}/markets",
-                    params={"next_cursor": next_cursor},
+                    f"{self.gamma_url}/markets",
+                    params={"active": True, "closed": False, "limit": 100, "offset": offset},
                     timeout=30,
                 )
                 resp.raise_for_status()
-                data = resp.json()
-
-                # Handle both list and paginated dict responses
-                if isinstance(data, dict):
-                    markets_list = data.get("data", [])
-                    next_cursor = data.get("next_cursor", "")
-                elif isinstance(data, list):
-                    markets_list = data
-                    next_cursor = ""
-                else:
+                batch = resp.json()
+                if not batch:
                     break
-
-                if not markets_list:
+                for m in batch:
+                    cid = m.get("conditionId", m.get("condition_id", ""))
+                    if cid:
+                        gamma_markets[cid] = m
+                if len(batch) < 100:
                     break
-
-                for m in markets_list:
-                    cid = m.get("condition_id", m.get("conditionId", ""))
-                    if not cid:
-                        continue
-                    # Only keep markets with active rewards (rates is not null/empty)
-                    rewards = m.get("rewards", {})
-                    if isinstance(rewards, dict) and rewards.get("rates"):
-                        clob_markets[cid] = m
-
-                page += 1
-                if not next_cursor or next_cursor == "LTE=":
-                    break
-                time.sleep(0.2)
+                offset += 100
+                time.sleep(0.15)
             except Exception as e:
-                log.warning(f"CLOB /markets page {page} error: {e}")
+                log.warning(f"Gamma /markets at offset {offset}: {e}")
                 break
 
-        log.info(f"CLOB API: {len(clob_markets)} markets with active rewards (scanned {page + 1} pages)")
+        log.info(f"Gamma API: {len(gamma_markets)} active markets")
 
-        if not clob_markets:
-            log.warning("No reward markets found from CLOB API, falling back to Gamma API")
-            return self._get_gamma_markets_fallback()
+        if not gamma_markets:
+            log.error("Failed to fetch any markets from Gamma API")
+            return []
 
-        # Enrich with Gamma API data (for question text, volume, etc. that CLOB may lack)
-        try:
-            gamma_by_cid = {}
-            offset = 0
-            while offset < 600:
+        # Step 2: Filter to markets with tokens, then check CLOB for rewards
+        candidates = []
+        for cid, m in gamma_markets.items():
+            tokens = self._get_tokens(m)
+            if tokens:
+                candidates.append((cid, m))
+
+        log.info(f"Markets with tokens: {len(candidates)} — checking CLOB for reward data...")
+
+        # Fetch CLOB reward data in parallel batches
+        reward_markets = []
+        checked = 0
+
+        def _check_rewards(item):
+            cid, gamma_m = item
+            try:
                 resp = self._session.get(
-                    f"{self.gamma_url}/markets",
-                    params={"active": True, "closed": False, "limit": 100, "offset": offset},
-                    timeout=30,
+                    f"{self.clob_url}/markets/{cid}",
+                    timeout=15,
                 )
-                resp.raise_for_status()
-                batch = resp.json()
-                if not batch:
-                    break
-                for m in batch:
-                    cid = m.get("conditionId", m.get("condition_id", ""))
-                    if cid:
-                        gamma_by_cid[cid] = m
-                if len(batch) < 100:
-                    break
-                offset += 100
-                time.sleep(0.2)
-            # Merge gamma data into clob markets (clob rewards data takes priority)
-            for cid, clob_m in clob_markets.items():
-                gamma_m = gamma_by_cid.get(cid, {})
-                if gamma_m:
-                    # Use gamma for metadata fields, keep clob reward fields
-                    merged = {**gamma_m, **clob_m}
-                    # Ensure clob rewards data is preserved
-                    merged["rewards"] = clob_m.get("rewards", {})
-                    clob_markets[cid] = merged
-            log.info(f"Enriched with Gamma API data ({len(gamma_by_cid)} total gamma markets)")
-        except Exception as e:
-            log.debug(f"Gamma enrichment failed (non-critical): {e}")
+                if resp.status_code == 200:
+                    clob_data = resp.json()
+                    rewards = clob_data.get("rewards", {})
+                    if isinstance(rewards, dict) and rewards.get("rates"):
+                        # Merge: gamma for metadata, clob for rewards
+                        merged = {**gamma_m, **clob_data}
+                        merged["rewards"] = rewards
+                        # Preserve gamma question/volume fields
+                        for key in ["question", "volume", "volume24hr"]:
+                            if key in gamma_m and gamma_m[key]:
+                                merged[key] = gamma_m[key]
+                        return merged
+            except Exception:
+                pass
+            return None
 
-        result = list(clob_markets.values())
-        log.info(f"Total reward markets to scan: {len(result)}")
-        return result
+        BATCH_SIZE = 12
+        for i in range(0, len(candidates), BATCH_SIZE):
+            batch = candidates[i:i + BATCH_SIZE]
+            with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
+                futures = [pool.submit(_check_rewards, item) for item in batch]
+                for f in as_completed(futures):
+                    try:
+                        result = f.result()
+                        if result:
+                            reward_markets.append(result)
+                    except Exception:
+                        pass
+            checked += len(batch)
+            if checked % 100 == 0 or i + BATCH_SIZE >= len(candidates):
+                log.info(f"  ...checked {checked}/{len(candidates)} markets, "
+                         f"found {len(reward_markets)} with rewards...")
 
-    def _get_gamma_markets_fallback(self) -> list[dict]:
-        """Fallback: fetch from Gamma API if CLOB fails."""
-        all_found = {}
-        try:
-            offset = 0
-            while offset < 600:
-                resp = self._session.get(
-                    f"{self.gamma_url}/markets",
-                    params={"active": True, "closed": False, "limit": 100, "offset": offset},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                batch = resp.json()
-                if not batch:
-                    break
-                for m in batch:
-                    cid = m.get("conditionId", m.get("condition_id", ""))
-                    if cid:
-                        all_found[cid] = m
-                if len(batch) < 100:
-                    break
-                offset += 100
-                time.sleep(0.2)
-            log.info(f"Gamma fallback: {len(all_found)} markets")
-        except Exception as e:
-            log.warning(f"Gamma fallback failed: {e}")
-        return list(all_found.values())
+        log.info(f"CLOB reward check: {len(reward_markets)} markets with active rewards "
+                 f"(checked {checked} markets)")
+
+        if not reward_markets:
+            log.warning("No reward markets found via CLOB individual lookups. "
+                        "Falling back to Gamma clobRewards field.")
+            # Fallback: use Gamma's clobRewards field
+            for cid, m in gamma_markets.items():
+                clob_rewards = m.get("clobRewards", [])
+                if isinstance(clob_rewards, list) and clob_rewards:
+                    for entry in clob_rewards:
+                        if isinstance(entry, dict):
+                            rate = entry.get("rewardsDailyRate", 0)
+                            try:
+                                if float(rate) > 0:
+                                    reward_markets.append(m)
+                                    break
+                            except (ValueError, TypeError):
+                                pass
+            log.info(f"Gamma clobRewards fallback: {len(reward_markets)} markets")
+
+        log.info(f"Total reward markets to scan: {len(reward_markets)}")
+        return reward_markets
 
     def _has_rewards(self, market: dict) -> bool:
         """Check if a market has active rewards. CLOB rewards.rates is authoritative."""
