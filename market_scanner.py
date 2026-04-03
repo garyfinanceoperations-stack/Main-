@@ -127,7 +127,7 @@ class MarketScanner:
             tokens = self._get_tokens(m)
             if not tokens:
                 continue
-            # Quick check: does Gamma hint this market has rewards?
+            # Quick check: does Gamma show this market has actual reward rates?
             clob_rewards = m.get("clobRewards", [])
             has_gamma_hint = False
             if isinstance(clob_rewards, list) and clob_rewards:
@@ -140,16 +140,6 @@ class MarketScanner:
                                 break
                         except (ValueError, TypeError):
                             pass
-            # Also check rewardsMinSize/rewardsMaxSpread as hints
-            if not has_gamma_hint:
-                min_s = m.get("rewardsMinSize")
-                max_s = m.get("rewardsMaxSpread")
-                if min_s and max_s:
-                    try:
-                        if float(min_s) > 0 and float(max_s) > 0:
-                            has_gamma_hint = True
-                    except (ValueError, TypeError):
-                        pass
             if has_gamma_hint:
                 candidates.append((cid, m))
 

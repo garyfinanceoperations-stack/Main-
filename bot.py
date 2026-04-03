@@ -542,8 +542,12 @@ def run_simulation(config: BotConfig):
     log.info("")
     log.info("  Reward eligibility check:")
     for m in selected:
+        yes_mid = m.midpoint
+        no_mid = 1.0 - m.midpoint
         for side, price, shares, cost, q in sim_orders:
-            spread_from_mid = abs(price - m.midpoint)
+            # Use the correct midpoint for each side
+            mid = yes_mid if side == "YES" else no_mid
+            spread_from_mid = abs(price - mid)
             within_max = spread_from_mid <= m.max_spread
             meets_min = shares >= m.min_size
             log.info(f"    {side} @ ${price:.4f}: spread_from_mid={spread_from_mid:.4f} "
