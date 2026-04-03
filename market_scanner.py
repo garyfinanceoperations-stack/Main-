@@ -661,9 +661,8 @@ class MarketScanner:
                     if no_best_ask == 0:
                         no_best_ask = no_mid + 0.02
 
-                # Spread must be >= 2c and <= 6c for primary targets
-                # Center-empty books are always OK (we define the spread)
-                spread_ok = center_is_empty or (0.02 <= spread <= 0.06)
+                # Spread must be <= 6c (or empty/center-empty books where we set our own spread)
+                spread_ok = center_is_empty or spread <= 0.06
 
                 # === RULE 5: Reward share estimate ===
                 if center_is_empty:
@@ -673,21 +672,21 @@ class MarketScanner:
 
                 volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
 
-                # === DECISION: Primary target or fallback? ===
+                # === DECISION: Skip markets with spread > 6c ===
                 is_fallback = False
 
+                if not spread_ok:
+                    stats["bad_spread"] += 1
+                    continue
+
                 if center_is_empty:
-                    # Empty center = PRIMARY — we'd be the only LP
+                    # Empty center = we'd be the only LP
                     pass
-                elif is_thin and spread_ok:
-                    # PRIMARY TARGET: thin book, good spread
+                elif is_thin:
+                    # Thin book, good spread — primary target
                     pass
-                elif is_thin and not spread_ok:
-                    # Thin book, spread > 6c — post 1c better than best
-                    is_fallback = True
-                    stats["fallback"] += 1
                 elif not is_thin and volume > 0:
-                    # FALLBACK: thick book but has volume
+                    # Thick book but has volume — still OK if spread <= 6c
                     is_fallback = True
                     stats["fallback"] += 1
                 else:
