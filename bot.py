@@ -376,6 +376,179 @@ class PolymarketLPBot:
         log.info(self.learner.get_learning_report())
 
 
+def run_simulation(config: BotConfig):
+    """
+    Full simulation: uses real market data but simulates order placement.
+    Tests the entire pipeline — scanning, reward detection, market selection,
+    price calculation, risk checks, and spending caps — with zero real money.
+    """
+    scanner = MarketScanner(config)
+    risk = RiskManager(config)
+    learner = Learner(config)
+
+    # === STEP 1: Scan for markets with rewards ===
+    log.info("=" * 60)
+    log.info("  STEP 1: Scanning for reward-eligible markets")
+    log.info("=" * 60)
+    markets = scanner.scan_for_opportunities()
+
+    if not markets:
+        log.error("No eligible markets found. Check VPN and DNS settings.")
+        return
+
+    # Filter through learner
+    markets = [m for m in markets if not learner.is_blacklisted(m.condition_id)]
+    for m in markets:
+        m.our_share_estimate = learner.score_market(
+            m.condition_id, m.reward_pool, m.our_share_estimate,
+            m.spread, m.orderbook_depth_yes + m.orderbook_depth_no,
+        )
+    markets.sort(key=lambda m: m.our_share_estimate, reverse=True)
+    selected = markets[:config.max_active_markets]
+
+    log.info("")
+    log.info("=" * 60)
+    log.info(f"  STEP 2: Selected {len(selected)} market(s) for LP")
+    log.info("=" * 60)
+
+    for i, m in enumerate(selected):
+        log.info(f"  [{i+1}] {m.question}")
+        log.info(f"      Condition: {m.condition_id[:24]}...")
+        log.info(f"      Reward: ${m.reward_pool:.2f}/day | Score: {m.our_share_estimate:.2%}")
+        log.info(f"      Midpoint: {m.midpoint:.4f} | Spread: {m.spread:.4f}")
+        log.info(f"      YES bid/ask: {m.yes_bid:.4f}/{m.yes_ask:.4f}")
+        log.info(f"      NO  bid/ask: {m.no_bid:.4f}/{m.no_ask:.4f}")
+        log.info(f"      Depth YES: ${m.orderbook_depth_yes:.0f} | NO: ${m.orderbook_depth_no:.0f}")
+        log.info(f"      Max spread for rewards: {m.max_spread:.4f} | Min size: {m.min_size:.0f}")
+        log.info(f"      Fallback market: {'YES' if m.is_fallback else 'NO'}")
+        log.info("")
+
+    # === STEP 3: Simulate order placement ===
+    log.info("=" * 60)
+    log.info("  STEP 3: Simulating order placement")
+    log.info("=" * 60)
+
+    total_simulated = 0.0
+    sim_orders = []
+    learned = learner.get_adjusted_params() or {}
+    min_edge = learned.get("min_edge", config.min_edge)
+    max_edge = learned.get("max_edge", config.max_edge)
+
+    for m in selected:
+        midpoint = m.midpoint
+        use_undercut = m.is_fallback or m.spread > 0.06
+
+        for level in range(config.num_price_levels):
+            edge = min_edge + (max_edge - min_edge) * level / max(1, config.num_price_levels - 1)
+            if edge > m.max_spread:
+                log.info(f"      Skipping level {level}: edge {edge:.4f} > max_spread {m.max_spread:.4f}")
+                continue
+
+            size_multiplier = 1.0 - (level * 0.15)
+            level_size = config.order_size * size_multiplier
+            if level_size < m.min_size:
+                level_size = m.min_size
+            if m.is_fallback:
+                level_size = max(m.min_size, 5.0)
+            max_per_side = config.max_exposure_per_market / 2
+            if level_size > max_per_side:
+                level_size = max_per_side
+
+            # YES side price
+            if use_undercut and m.yes_bid > 0 and abs(m.yes_bid - midpoint) <= 0.15:
+                yes_price = round(m.yes_bid + 0.01, 4)
+                yes_method = "undercut"
+            else:
+                yes_price = round(midpoint - edge, 4)
+                yes_method = "midpoint-edge"
+            yes_price = max(0.01, min(0.99, yes_price))
+            yes_shares = round(level_size / yes_price, 2) if yes_price > 0 else 0
+            yes_cost = yes_price * yes_shares
+
+            # NO side price
+            no_mid = 1 - midpoint
+            if use_undercut and m.no_bid > 0 and abs(m.no_bid - no_mid) <= 0.15:
+                no_price = round(m.no_bid + 0.01, 4)
+                no_method = "undercut"
+            else:
+                no_price = round(no_mid - edge, 4)
+                no_method = "midpoint-edge"
+            no_price = max(0.01, min(0.99, no_price))
+            no_shares = round(level_size / no_price, 2) if no_price > 0 else 0
+            no_cost = no_price * no_shares
+
+            # Safety check: YES bid + NO bid <= 0.98
+            if yes_price + no_price > 0.98:
+                excess = (yes_price + no_price) - 0.98
+                yes_price = round(yes_price - excess / 2, 4)
+                no_price = round(no_price - excess / 2, 4)
+
+            # Risk check simulation
+            ok_yes, reason_yes = risk.can_place_order(m.condition_id, "BUY", yes_cost)
+            ok_no, reason_no = risk.can_place_order(m.condition_id, "BUY", no_cost)
+
+            log.info(f"  Market: {m.question[:50]}")
+            log.info(f"    YES BUY: {yes_shares:.2f} shares @ ${yes_price:.4f} = ${yes_cost:.2f} "
+                     f"[{yes_method}] {'OK' if ok_yes else f'BLOCKED: {reason_yes}'}")
+            log.info(f"    NO  BUY: {no_shares:.2f} shares @ ${no_price:.4f} = ${no_cost:.2f} "
+                     f"[{no_method}] {'OK' if ok_no else f'BLOCKED: {reason_no}'}")
+
+            if ok_yes:
+                risk.register_pending_order(m.condition_id, yes_cost)
+                total_simulated += yes_cost
+                sim_orders.append(("YES", yes_price, yes_shares, yes_cost, m.question[:40]))
+            if ok_no:
+                risk.register_pending_order(m.condition_id, no_cost)
+                total_simulated += no_cost
+                sim_orders.append(("NO", no_price, no_shares, no_cost, m.question[:40]))
+
+    # === STEP 4: Summary ===
+    log.info("")
+    log.info("=" * 60)
+    log.info("  SIMULATION SUMMARY")
+    log.info("=" * 60)
+    log.info(f"  Markets scanned: {len(markets)} eligible")
+    log.info(f"  Markets selected: {len(selected)}")
+    log.info(f"  Orders simulated: {len(sim_orders)}")
+    log.info(f"  Total USD committed: ${total_simulated:.2f}")
+    log.info("")
+
+    if sim_orders:
+        log.info("  Simulated orders:")
+        for side, price, shares, cost, q in sim_orders:
+            log.info(f"    {side:3s} BUY {shares:>8.2f} @ ${price:.4f} = ${cost:.2f}  |  {q}")
+    else:
+        log.info("  No orders would be placed (all blocked by risk manager)")
+
+    # Check spending cap
+    spending_cap = 10.0
+    if total_simulated >= spending_cap:
+        log.info(f"\n  Spending cap would trigger at ${spending_cap:.2f} "
+                 f"(total: ${total_simulated:.2f}) - bot would stop placing orders")
+    else:
+        log.info(f"\n  Under spending cap: ${total_simulated:.2f} / ${spending_cap:.2f}")
+
+    # Check if orders would score for rewards
+    log.info("")
+    log.info("  Reward eligibility check:")
+    for m in selected:
+        for side, price, shares, cost, q in sim_orders:
+            spread_from_mid = abs(price - m.midpoint)
+            within_max = spread_from_mid <= m.max_spread
+            meets_min = shares >= m.min_size
+            log.info(f"    {side} @ ${price:.4f}: spread_from_mid={spread_from_mid:.4f} "
+                     f"{'<=' if within_max else '>'} max_spread={m.max_spread:.4f} "
+                     f"{'OK' if within_max else 'NO REWARD'} | "
+                     f"size={shares:.0f} {'>=':s} min={m.min_size:.0f} "
+                     f"{'OK' if meets_min else 'TOO SMALL'}")
+
+    log.info("")
+    log.info("=" * 60)
+    log.info("  SIMULATION COMPLETE - No real orders placed")
+    log.info("  Run with --live-test to place real orders ($10 cap)")
+    log.info("=" * 60)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polymarket LP Bot")
     parser.add_argument("--dry-run", action="store_true",
@@ -389,6 +562,10 @@ def main():
     parser.add_argument("--live-test", action="store_true",
                         help="Live test: place up to $10 in orders, then stop placing new ones. "
                              "Keeps running to monitor fills and manage risk.")
+    parser.add_argument("--simulate", action="store_true",
+                        help="Full simulation: scan real markets, calculate prices, "
+                             "simulate order placement with no real money. "
+                             "Tests the entire pipeline without touching your wallet.")
     parser.add_argument("--learning", action="store_true",
                         help="Show learning engine status and exit")
     parser.add_argument("--unblacklist", type=str, default=None,
@@ -495,6 +672,17 @@ def main():
         except Exception as e:
             log.error(f"cancel_all error: {e}")
         orders.active_orders.clear()
+        return
+
+    if args.simulate:
+        log.info("=" * 60)
+        log.info("  SIMULATION MODE - NO REAL MONEY")
+        log.info("=" * 60)
+        config.order_size = 5.0
+        config.num_price_levels = 1
+        config.max_active_markets = 3
+        config.max_exposure_per_market = 10.0
+        run_simulation(config)
         return
 
     if args.live_test:
