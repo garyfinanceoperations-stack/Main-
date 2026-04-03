@@ -444,16 +444,7 @@ def run_simulation(config: BotConfig):
                 log.info(f"      Skipping level {level}: edge {edge:.4f} > max_spread {m.max_spread:.4f}")
                 continue
 
-            size_multiplier = 1.0 - (level * 0.15)
-            base_usd = config.order_size * size_multiplier
-            # min_size is in SHARES — calculate USD needed to meet it
-            min_usd_for_shares = m.min_size * midpoint
-            level_size = max(base_usd, min_usd_for_shares)
             max_per_side = config.max_exposure_per_market / 2
-            if level_size > max_per_side:
-                level_size = max_per_side
-                log.info(f"      Capped at ${level_size:.2f}/side. "
-                         f"Need ${min_usd_for_shares:.2f} for {m.min_size:.0f} min shares.")
 
             # YES side price
             if use_undercut and m.yes_bid > 0 and abs(m.yes_bid - midpoint) <= 0.15:
@@ -463,8 +454,14 @@ def run_simulation(config: BotConfig):
                 yes_price = round(midpoint - edge, 4)
                 yes_method = "midpoint-edge"
             yes_price = max(0.01, min(0.99, yes_price))
-            yes_shares = round(level_size / yes_price, 2) if yes_price > 0 else 0
-            yes_cost = yes_price * yes_shares
+
+            # YES shares: at least min_size, capped by exposure
+            yes_shares = max(m.min_size, round(config.order_size / yes_price, 2)) if yes_price > 0 else 0
+            yes_cost = yes_shares * yes_price
+            if yes_cost > max_per_side:
+                yes_shares = round(max_per_side / yes_price, 2)
+                yes_cost = yes_shares * yes_price
+            yes_meets_min = yes_shares >= m.min_size
 
             # NO side price
             no_mid = 1 - midpoint
@@ -475,8 +472,14 @@ def run_simulation(config: BotConfig):
                 no_price = round(no_mid - edge, 4)
                 no_method = "midpoint-edge"
             no_price = max(0.01, min(0.99, no_price))
-            no_shares = round(level_size / no_price, 2) if no_price > 0 else 0
-            no_cost = no_price * no_shares
+
+            # NO shares: at least min_size, capped by exposure
+            no_shares = max(m.min_size, round(config.order_size / no_price, 2)) if no_price > 0 else 0
+            no_cost = no_shares * no_price
+            if no_cost > max_per_side:
+                no_shares = round(max_per_side / no_price, 2)
+                no_cost = no_shares * no_price
+            no_meets_min = no_shares >= m.min_size
 
             # Safety check: YES bid + NO bid <= 0.98
             if yes_price + no_price > 0.98:
@@ -489,19 +492,25 @@ def run_simulation(config: BotConfig):
             ok_no, reason_no = risk.can_place_order(m.condition_id, "BUY", no_cost)
 
             log.info(f"  Market: {m.question[:50]}")
-            log.info(f"    YES BUY: {yes_shares:.2f} shares @ ${yes_price:.4f} = ${yes_cost:.2f} "
-                     f"[{yes_method}] {'OK' if ok_yes else f'BLOCKED: {reason_yes}'}")
-            log.info(f"    NO  BUY: {no_shares:.2f} shares @ ${no_price:.4f} = ${no_cost:.2f} "
-                     f"[{no_method}] {'OK' if ok_no else f'BLOCKED: {reason_no}'}")
+            log.info(f"    YES BUY: {yes_shares:.0f} shares @ ${yes_price:.4f} = ${yes_cost:.2f} "
+                     f"[{yes_method}] {'MEETS MIN' if yes_meets_min else 'BELOW MIN'} "
+                     f"{'OK' if ok_yes else f'BLOCKED: {reason_yes}'}")
+            log.info(f"    NO  BUY: {no_shares:.0f} shares @ ${no_price:.4f} = ${no_cost:.2f} "
+                     f"[{no_method}] {'MEETS MIN' if no_meets_min else 'BELOW MIN'} "
+                     f"{'OK' if ok_no else f'BLOCKED: {reason_no}'}")
 
-            if ok_yes:
+            if ok_yes and yes_meets_min:
                 risk.register_pending_order(m.condition_id, yes_cost)
                 total_simulated += yes_cost
                 sim_orders.append(("YES", yes_price, yes_shares, yes_cost, m.question[:40]))
-            if ok_no:
+            elif not yes_meets_min:
+                log.info(f"    ^ YES skipped: {yes_shares:.0f} < {m.min_size:.0f} min shares")
+            if ok_no and no_meets_min:
                 risk.register_pending_order(m.condition_id, no_cost)
                 total_simulated += no_cost
                 sim_orders.append(("NO", no_price, no_shares, no_cost, m.question[:40]))
+            elif not no_meets_min:
+                log.info(f"    ^ NO skipped: {no_shares:.0f} < {m.min_size:.0f} min shares")
 
     # === STEP 4: Summary ===
     log.info("")
@@ -522,7 +531,7 @@ def run_simulation(config: BotConfig):
         log.info("  No orders would be placed (all blocked by risk manager)")
 
     # Check spending cap
-    spending_cap = 10.0
+    spending_cap = 50.0
     if total_simulated >= spending_cap:
         log.info(f"\n  Spending cap would trigger at ${spending_cap:.2f} "
                  f"(total: ${total_simulated:.2f}) - bot would stop placing orders")
@@ -679,24 +688,24 @@ def main():
         log.info("=" * 60)
         log.info("  SIMULATION MODE - NO REAL MONEY")
         log.info("=" * 60)
-        config.order_size = 5.0
+        config.order_size = 10.0
         config.num_price_levels = 1
         config.max_active_markets = 3
-        config.max_exposure_per_market = 10.0
+        config.max_exposure_per_market = 50.0
         run_simulation(config)
         return
 
     if args.live_test:
-        # Override config for safe $10 test
-        config.order_size = 5.0
+        # Override config for safe $50 test
+        config.order_size = 10.0
         config.num_price_levels = 1
         config.max_active_markets = 1
-        config.max_exposure_per_market = 10.0
-        config.max_loss_per_position = 3.0
-        config.emergency_loss_threshold = 5.0
-        config.portfolio_stop_loss = 10.0
-        log.info("LIVE TEST: $10 cap | $5/order | 1 market | $3 max loss | $10 stop-loss")
-        bot = PolymarketLPBot(config, spending_cap=10.0)
+        config.max_exposure_per_market = 50.0
+        config.max_loss_per_position = 5.0
+        config.emergency_loss_threshold = 10.0
+        config.portfolio_stop_loss = 25.0
+        log.info("LIVE TEST: $50 cap | 1 market | $5 max loss | $25 stop-loss")
+        bot = PolymarketLPBot(config, spending_cap=50.0)
     else:
         bot = PolymarketLPBot(config, dry_run=args.dry_run)
     bot.run()
