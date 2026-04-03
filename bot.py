@@ -163,17 +163,22 @@ class PolymarketLPBot:
                 log.error(f"Error refreshing quotes for {market.condition_id[:16]}: {e}")
 
     def _update_spending(self):
-        """Track total USD in open orders and check against spending cap."""
+        """Track total USD in open orders and check against spending cap.
+        Uses the current active orders total — once we've placed our first
+        batch of orders, we set cap_reached so the bot stops placing more.
+        """
         if self.spending_cap <= 0 or not self.orders:
             return
-        self.total_spent = sum(
+        current_orders_usd = sum(
             info.get("cost_usd", info.get("price", 0) * info.get("size", 0))
             for info in self.orders.active_orders.values()
         )
+        # Track the high-water mark of spending
+        self.total_spent = max(self.total_spent, current_orders_usd)
         if self.total_spent >= self.spending_cap:
             self.cap_reached = True
             log.info(
-                f"SPENDING CAP REACHED: ${self.total_spent:.2f} / ${self.spending_cap:.2f} in open orders. "
+                f"SPENDING CAP REACHED: ${self.total_spent:.2f} / ${self.spending_cap:.2f}. "
                 f"No more orders will be placed. Monitoring positions and risk."
             )
 
@@ -280,7 +285,7 @@ class PolymarketLPBot:
             try:
                 cycle_start = time.time()
 
-                # Only place new orders if cap not reached
+                # Only place/refresh orders if cap not reached
                 if not self.cap_reached:
                     # Full market scan periodically
                     if scan_counter % FULL_SCAN_EVERY == 0:
@@ -288,16 +293,16 @@ class PolymarketLPBot:
                         markets = self.scan_and_select_markets()
                         if markets:
                             self.refresh_quotes(markets)
-                            # Track spending
                             self._update_spending()
-                    else:
+                    # Don't do quick-refresh cycles when spending cap is active
+                    # The first placement is enough — no need to cancel+repost
+                    elif self.spending_cap <= 0:
                         # Quick refresh: just update quotes for existing markets
                         existing = [
                             info["market"]
                             for info in self.active_markets.values()
                         ]
                         if existing:
-                            # Re-fetch book data for existing markets
                             refreshed = []
                             for m in existing:
                                 book_yes = self.scanner.get_orderbook(m.token_yes)

@@ -80,21 +80,112 @@ class MarketScanner:
         return markets
 
     def get_rewards_markets(self) -> list[dict]:
-        """Fetch active markets from all available sources."""
-        all_found = {}  # condition_id -> market dict (dedup)
+        """
+        Fetch markets that have ACTIVE liquidity rewards from the CLOB API.
+        The CLOB /markets endpoint is the authoritative source — it returns
+        a 'rewards' object with 'rates', 'max_spread', 'min_size'.
+        Only markets where rewards.rates is non-null/non-empty are on the
+        Polymarket rewards page.
+        """
+        # CLOB API /markets is paginated with next_cursor
+        clob_markets = {}  # condition_id -> market dict
+        next_cursor = "MA=="
+        page = 0
 
-        # Source 1: Gamma API /markets - most reliable, returns many markets
+        while True:
+            try:
+                resp = self._session.get(
+                    f"{self.clob_url}/markets",
+                    params={"next_cursor": next_cursor},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                # Handle both list and paginated dict responses
+                if isinstance(data, dict):
+                    markets_list = data.get("data", [])
+                    next_cursor = data.get("next_cursor", "")
+                elif isinstance(data, list):
+                    markets_list = data
+                    next_cursor = ""
+                else:
+                    break
+
+                if not markets_list:
+                    break
+
+                for m in markets_list:
+                    cid = m.get("condition_id", m.get("conditionId", ""))
+                    if not cid:
+                        continue
+                    # Only keep markets with active rewards (rates is not null/empty)
+                    rewards = m.get("rewards", {})
+                    if isinstance(rewards, dict) and rewards.get("rates"):
+                        clob_markets[cid] = m
+
+                page += 1
+                if not next_cursor or next_cursor == "LTE=":
+                    break
+                time.sleep(0.2)
+            except Exception as e:
+                log.warning(f"CLOB /markets page {page} error: {e}")
+                break
+
+        log.info(f"CLOB API: {len(clob_markets)} markets with active rewards (scanned {page + 1} pages)")
+
+        if not clob_markets:
+            log.warning("No reward markets found from CLOB API, falling back to Gamma API")
+            return self._get_gamma_markets_fallback()
+
+        # Enrich with Gamma API data (for question text, volume, etc. that CLOB may lack)
         try:
+            gamma_by_cid = {}
             offset = 0
-            while offset < 600:  # fetch up to 600 markets
+            while offset < 600:
                 resp = self._session.get(
                     f"{self.gamma_url}/markets",
-                    params={
-                        "active": True,
-                        "closed": False,
-                        "limit": 100,
-                        "offset": offset,
-                    },
+                    params={"active": True, "closed": False, "limit": 100, "offset": offset},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+                if not batch:
+                    break
+                for m in batch:
+                    cid = m.get("conditionId", m.get("condition_id", ""))
+                    if cid:
+                        gamma_by_cid[cid] = m
+                if len(batch) < 100:
+                    break
+                offset += 100
+                time.sleep(0.2)
+            # Merge gamma data into clob markets (clob rewards data takes priority)
+            for cid, clob_m in clob_markets.items():
+                gamma_m = gamma_by_cid.get(cid, {})
+                if gamma_m:
+                    # Use gamma for metadata fields, keep clob reward fields
+                    merged = {**gamma_m, **clob_m}
+                    # Ensure clob rewards data is preserved
+                    merged["rewards"] = clob_m.get("rewards", {})
+                    clob_markets[cid] = merged
+            log.info(f"Enriched with Gamma API data ({len(gamma_by_cid)} total gamma markets)")
+        except Exception as e:
+            log.debug(f"Gamma enrichment failed (non-critical): {e}")
+
+        result = list(clob_markets.values())
+        log.info(f"Total reward markets to scan: {len(result)}")
+        return result
+
+    def _get_gamma_markets_fallback(self) -> list[dict]:
+        """Fallback: fetch from Gamma API if CLOB fails."""
+        all_found = {}
+        try:
+            offset = 0
+            while offset < 600:
+                resp = self._session.get(
+                    f"{self.gamma_url}/markets",
+                    params={"active": True, "closed": False, "limit": 100, "offset": offset},
                     timeout=30,
                 )
                 resp.raise_for_status()
@@ -109,94 +200,57 @@ class MarketScanner:
                     break
                 offset += 100
                 time.sleep(0.2)
-            log.info(f"Gamma /markets: {len(all_found)} active markets")
+            log.info(f"Gamma fallback: {len(all_found)} markets")
         except Exception as e:
-            log.warning(f"Gamma /markets failed: {e}")
-
-        # Source 2: CLOB /markets - may have reward data the Gamma API lacks
-        try:
-            resp = self._session.get(
-                f"{self.clob_url}/markets",
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict):
-                data = data.get("data", data.get("markets", []))
-            if isinstance(data, list):
-                for m in data:
-                    cid = m.get("conditionId", m.get("condition_id", ""))
-                    if cid:
-                        # Merge reward data into existing entry
-                        if cid in all_found:
-                            if self._has_rewards(m):
-                                all_found[cid].update({
-                                    k: v for k, v in m.items()
-                                    if "reward" in k.lower() or "incentive" in k.lower()
-                                })
-                        else:
-                            all_found[cid] = m
-                log.info(f"CLOB /markets: merged, total {len(all_found)} markets")
-        except Exception as e:
-            log.debug(f"CLOB /markets: {e}")
-
-        # Source 3: Gamma /events - catches markets not in /markets
-        if len(all_found) < 20:
-            try:
-                resp = self._session.get(
-                    f"{self.gamma_url}/events",
-                    params={"active": True, "closed": False, "limit": 100},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                events = resp.json()
-                for event in events:
-                    for m in event.get("markets", []):
-                        cid = m.get("conditionId", m.get("condition_id", ""))
-                        if cid and cid not in all_found:
-                            m["question"] = m.get("question", event.get("title", ""))
-                            all_found[cid] = m
-                log.info(f"After /events: total {len(all_found)} markets")
-            except Exception as e:
-                log.debug(f"Gamma /events: {e}")
-
-        result = list(all_found.values())
-        log.info(f"Total markets to scan: {len(result)}")
-        return result
+            log.warning(f"Gamma fallback failed: {e}")
+        return list(all_found.values())
 
     def _has_rewards(self, market: dict) -> bool:
-        """Check if a market dictionary indicates it has active rewards."""
-        # CLOB API nests under "rewards" object with "rates" inside
+        """Check if a market has active rewards. CLOB rewards.rates is authoritative."""
+        # CLOB API: rewards.rates is the authoritative source (matches rewards page)
         rewards_obj = market.get("rewards", {})
         if isinstance(rewards_obj, dict):
             rates = rewards_obj.get("rates")
             if rates:
+                # rates can be a list of dicts with rewards_daily_rate
+                if isinstance(rates, list):
+                    return any(
+                        float(r.get("rewards_daily_rate", r.get("rewardsDailyRate", 0))) > 0
+                        for r in rates if isinstance(r, dict)
+                    )
                 try:
-                    # rates can be a list of dicts or a single value
-                    if isinstance(rates, list):
-                        return any(float(r.get("rewards_daily_rate", 0)) > 0 for r in rates)
                     return float(rates) > 0
                 except (ValueError, TypeError):
-                    pass
-
-        # Gamma API / flat field fallbacks
-        for key in ["rewardsDaily", "rewards_daily_rate",
-                     "rewardsDailyRate", "liquidityRewards", "clobRewards"]:
-            val = market.get(key)
-            if val:
-                try:
-                    if isinstance(val, dict):
-                        return bool(val)
-                    return float(val) > 0
-                except (ValueError, TypeError):
-                    continue
+                    return bool(rates)  # non-empty = has rewards
         return False
 
     def _get_reward_amount(self, market: dict) -> float:
-        """Extract the daily reward amount from a market dict."""
+        """Extract the daily reward amount from a market dict.
+        CLOB API rewards.rates is the authoritative source (matches rewards page)."""
         total = 0.0
 
-        # Gamma API: clobRewards array (most reliable source)
+        # PRIMARY: CLOB API rewards.rates (this is what the rewards page shows)
+        rewards_obj = market.get("rewards", {})
+        if isinstance(rewards_obj, dict):
+            rates = rewards_obj.get("rates")
+            if rates:
+                if isinstance(rates, list):
+                    for r in rates:
+                        if isinstance(r, dict):
+                            rate = r.get("rewards_daily_rate", r.get("rewardsDailyRate", 0))
+                            try:
+                                total += float(rate)
+                            except (ValueError, TypeError):
+                                pass
+                else:
+                    try:
+                        total += float(rates)
+                    except (ValueError, TypeError):
+                        pass
+        if total > 0:
+            return total
+
+        # FALLBACK: Gamma API clobRewards array
         clob_rewards = market.get("clobRewards", [])
         if isinstance(clob_rewards, list):
             for entry in clob_rewards:
@@ -209,55 +263,11 @@ class MarketScanner:
         if total > 0:
             return total
 
-        # CLOB API: nested rewards.rates structure
-        rewards_obj = market.get("rewards", {})
-        if isinstance(rewards_obj, dict):
-            rates = rewards_obj.get("rates")
-            if rates:
-                try:
-                    if isinstance(rates, list):
-                        return sum(float(r.get("rewards_daily_rate", 0)) for r in rates)
-                    return float(rates)
-                except (ValueError, TypeError):
-                    pass
-
-        # Flat field fallbacks
-        for key in ["rewardsDaily", "rewards_daily_rate",
-                     "rewardsDailyRate", "liquidityRewards"]:
-            val = market.get(key)
-            if val:
-                try:
-                    v = float(val)
-                    if v > 0:
-                        return v
-                except (ValueError, TypeError):
-                    continue
-
-        # If market has rewardsMinSize and rewardsMaxSpread set, it likely has rewards
-        min_size = market.get("rewardsMinSize")
-        max_spread = market.get("rewardsMaxSpread")
-        if min_size and max_spread:
-            try:
-                if float(min_size) > 0 and float(max_spread) > 0:
-                    return 1.0  # has rewards but unknown amount
-            except (ValueError, TypeError):
-                pass
-
         return 0.0
 
     def _get_max_spread(self, market: dict) -> float:
-        """Get the max spread for reward eligibility."""
-        # Gamma API flat field (most common)
-        val = market.get("rewardsMaxSpread")
-        if val:
-            try:
-                v = float(val)
-                if v > 0:
-                    return v / 100 if v > 1 else v  # normalize: 3.5 -> 0.035
-            except (ValueError, TypeError):
-                pass
-
-        # CLOB API nested
+        """Get the max spread for reward eligibility. CLOB rewards data is authoritative."""
+        # PRIMARY: CLOB API rewards.max_spread
         rewards_obj = market.get("rewards", {})
         if isinstance(rewards_obj, dict):
             for key in ["max_spread", "maxSpread"]:
@@ -270,21 +280,21 @@ class MarketScanner:
                     except (ValueError, TypeError):
                         pass
 
-        # Flat field fallbacks
-        for key in ["rewards_max_spread", "maxIncentiveSpread", "max_incentive_spread"]:
-            val = market.get(key)
-            if val:
-                try:
-                    v = float(val)
-                    if v > 0:
-                        return v / 100 if v > 1 else v
-                except (ValueError, TypeError):
-                    continue
+        # FALLBACK: Gamma API flat field
+        val = market.get("rewardsMaxSpread")
+        if val:
+            try:
+                v = float(val)
+                if v > 0:
+                    return v / 100 if v > 1 else v
+            except (ValueError, TypeError):
+                pass
+
         return 0.035  # default 3.5 cents
 
     def _get_min_size(self, market: dict) -> float:
-        """Get the minimum order size for reward eligibility."""
-        # CLOB API nested
+        """Get the minimum order size for reward eligibility. CLOB rewards data is authoritative."""
+        # PRIMARY: CLOB API rewards.min_size
         rewards_obj = market.get("rewards", {})
         if isinstance(rewards_obj, dict):
             for key in ["min_size", "minSize"]:
@@ -295,9 +305,8 @@ class MarketScanner:
                     except (ValueError, TypeError):
                         pass
 
-        # Flat field fallbacks
-        for key in ["rewardsMinSize", "rewards_min_size",
-                     "minIncentiveSize", "min_incentive_size"]:
+        # FALLBACK: Gamma API flat field
+        for key in ["rewardsMinSize", "rewards_min_size"]:
             val = market.get(key)
             if val:
                 try:

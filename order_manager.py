@@ -288,7 +288,11 @@ class OrderManager:
             # === YES side ===
             if use_undercut and market.yes_bid > 0:
                 # Post 1 cent better than the current best bid
-                yes_bid_price = round(market.yes_bid + 0.01, 4)
+                # But only if the bid is within 15c of midpoint (ignore dust bids)
+                if abs(market.yes_bid - midpoint) <= 0.15:
+                    yes_bid_price = round(market.yes_bid + 0.01, 4)
+                else:
+                    yes_bid_price = round(midpoint - edge, 4)
             else:
                 yes_bid_price = round(midpoint - edge, 4)
 
@@ -312,10 +316,15 @@ class OrderManager:
             # For initial LP, we buy on both sides to provide liquidity
 
             # === NO side ===
+            no_mid = 1 - midpoint
             if use_undercut and market.no_bid > 0:
-                no_bid_price = round(market.no_bid + 0.01, 4)
+                # Only undercut if bid is within 15c of NO midpoint (ignore dust bids)
+                if abs(market.no_bid - no_mid) <= 0.15:
+                    no_bid_price = round(market.no_bid + 0.01, 4)
+                else:
+                    no_bid_price = round(no_mid - edge, 4)
             else:
-                no_bid_price = round((1 - midpoint) - edge, 4)
+                no_bid_price = round(no_mid - edge, 4)
             no_ask_price = round((1 - midpoint) + edge, 4)
             no_bid_price = max(0.01, min(0.99, no_bid_price))
             no_ask_price = max(0.01, min(0.99, no_ask_price))
