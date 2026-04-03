@@ -84,12 +84,10 @@ class MarketScanner:
         Fetch markets with ACTIVE liquidity rewards.
 
         Strategy:
-        1. Gamma API /markets (fast, paginated with offset) — get all active markets
-        2. For each market with tokens, fetch CLOB /markets/{condition_id} to get
-           authoritative reward data (rewards.rates, max_spread, min_size)
-        3. Only keep markets where rewards.rates is populated (= on rewards page)
-
-        This avoids the slow/huge CLOB /markets bulk endpoint.
+        1. Gamma API /markets (fast, paginated) — get all active markets
+        2. Pre-filter: only markets with clobRewards data in Gamma (already hints at rewards)
+        3. For those ~200 markets, fetch CLOB /markets/{cid} for authoritative reward data
+        4. Fallback: if CLOB check fails, use Gamma clobRewards directly
         """
         # Step 1: Fetch all active markets from Gamma (fast)
         gamma_markets = {}
@@ -123,16 +121,41 @@ class MarketScanner:
             log.error("Failed to fetch any markets from Gamma API")
             return []
 
-        # Step 2: Filter to markets with tokens, then check CLOB for rewards
+        # Step 2: Pre-filter — only check CLOB for markets Gamma flags as having rewards
         candidates = []
         for cid, m in gamma_markets.items():
             tokens = self._get_tokens(m)
-            if tokens:
+            if not tokens:
+                continue
+            # Quick check: does Gamma hint this market has rewards?
+            clob_rewards = m.get("clobRewards", [])
+            has_gamma_hint = False
+            if isinstance(clob_rewards, list) and clob_rewards:
+                for entry in clob_rewards:
+                    if isinstance(entry, dict):
+                        rate = entry.get("rewardsDailyRate", 0)
+                        try:
+                            if float(rate) > 0:
+                                has_gamma_hint = True
+                                break
+                        except (ValueError, TypeError):
+                            pass
+            # Also check rewardsMinSize/rewardsMaxSpread as hints
+            if not has_gamma_hint:
+                min_s = m.get("rewardsMinSize")
+                max_s = m.get("rewardsMaxSpread")
+                if min_s and max_s:
+                    try:
+                        if float(min_s) > 0 and float(max_s) > 0:
+                            has_gamma_hint = True
+                    except (ValueError, TypeError):
+                        pass
+            if has_gamma_hint:
                 candidates.append((cid, m))
 
-        log.info(f"Markets with tokens: {len(candidates)} — checking CLOB for reward data...")
+        log.info(f"Gamma reward hints: {len(candidates)} markets — verifying with CLOB API...")
 
-        # Fetch CLOB reward data in parallel batches
+        # Step 3: Verify with CLOB individual lookups (parallel, only ~200 not 800)
         reward_markets = []
         checked = 0
 
@@ -141,25 +164,24 @@ class MarketScanner:
             try:
                 resp = self._session.get(
                     f"{self.clob_url}/markets/{cid}",
-                    timeout=15,
+                    timeout=10,
                 )
                 if resp.status_code == 200:
                     clob_data = resp.json()
                     rewards = clob_data.get("rewards", {})
                     if isinstance(rewards, dict) and rewards.get("rates"):
-                        # Merge: gamma for metadata, clob for rewards
                         merged = {**gamma_m, **clob_data}
                         merged["rewards"] = rewards
-                        # Preserve gamma question/volume fields
                         for key in ["question", "volume", "volume24hr"]:
                             if key in gamma_m and gamma_m[key]:
                                 merged[key] = gamma_m[key]
                         return merged
             except Exception:
                 pass
-            return None
+            # Fallback: return gamma data with clobRewards as reward source
+            return gamma_m
 
-        BATCH_SIZE = 12
+        BATCH_SIZE = 16
         for i in range(0, len(candidates), BATCH_SIZE):
             batch = candidates[i:i + BATCH_SIZE]
             with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
@@ -172,32 +194,12 @@ class MarketScanner:
                     except Exception:
                         pass
             checked += len(batch)
-            if checked % 100 == 0 or i + BATCH_SIZE >= len(candidates):
-                log.info(f"  ...checked {checked}/{len(candidates)} markets, "
-                         f"found {len(reward_markets)} with rewards...")
+            if checked % 50 == 0 or i + BATCH_SIZE >= len(candidates):
+                log.info(f"  ...verified {checked}/{len(candidates)}, "
+                         f"{len(reward_markets)} confirmed with rewards...")
 
-        log.info(f"CLOB reward check: {len(reward_markets)} markets with active rewards "
-                 f"(checked {checked} markets)")
-
-        if not reward_markets:
-            log.warning("No reward markets found via CLOB individual lookups. "
-                        "Falling back to Gamma clobRewards field.")
-            # Fallback: use Gamma's clobRewards field
-            for cid, m in gamma_markets.items():
-                clob_rewards = m.get("clobRewards", [])
-                if isinstance(clob_rewards, list) and clob_rewards:
-                    for entry in clob_rewards:
-                        if isinstance(entry, dict):
-                            rate = entry.get("rewardsDailyRate", 0)
-                            try:
-                                if float(rate) > 0:
-                                    reward_markets.append(m)
-                                    break
-                            except (ValueError, TypeError):
-                                pass
-            log.info(f"Gamma clobRewards fallback: {len(reward_markets)} markets")
-
-        log.info(f"Total reward markets to scan: {len(reward_markets)}")
+        log.info(f"Reward check done: {len(reward_markets)} markets with rewards "
+                 f"(from {checked} candidates)")
         return reward_markets
 
     def _has_rewards(self, market: dict) -> bool:
