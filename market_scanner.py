@@ -162,7 +162,8 @@ class MarketScanner:
                     if isinstance(rewards, dict) and rewards.get("rates"):
                         merged = {**gamma_m, **clob_data}
                         merged["rewards"] = rewards
-                        for key in ["question", "volume", "volume24hr"]:
+                        # Preserve gamma fields that CLOB may overwrite/lack
+                        for key in ["question", "volume", "volume24hr", "clobRewards"]:
                             if key in gamma_m and gamma_m[key]:
                                 merged[key] = gamma_m[key]
                         return merged
@@ -213,31 +214,11 @@ class MarketScanner:
 
     def _get_reward_amount(self, market: dict) -> float:
         """Extract the daily reward amount from a market dict.
-        CLOB API rewards.rates is the authoritative source (matches rewards page)."""
+        Checks both Gamma clobRewards and CLOB rewards.rates."""
         total = 0.0
 
-        # PRIMARY: CLOB API rewards.rates (this is what the rewards page shows)
-        rewards_obj = market.get("rewards", {})
-        if isinstance(rewards_obj, dict):
-            rates = rewards_obj.get("rates")
-            if rates:
-                if isinstance(rates, list):
-                    for r in rates:
-                        if isinstance(r, dict):
-                            rate = r.get("rewards_daily_rate", r.get("rewardsDailyRate", 0))
-                            try:
-                                total += float(rate)
-                            except (ValueError, TypeError):
-                                pass
-                else:
-                    try:
-                        total += float(rates)
-                    except (ValueError, TypeError):
-                        pass
-        if total > 0:
-            return total
-
-        # FALLBACK: Gamma API clobRewards array
+        # SOURCE 1: Gamma clobRewards array (confirmed format):
+        # [{"rewardsDailyRate": 1, "conditionId": "...", ...}]
         clob_rewards = market.get("clobRewards", [])
         if isinstance(clob_rewards, list):
             for entry in clob_rewards:
@@ -249,6 +230,40 @@ class MarketScanner:
                         pass
         if total > 0:
             return total
+
+        # SOURCE 2: CLOB API rewards.rates
+        rewards_obj = market.get("rewards", {})
+        if isinstance(rewards_obj, dict):
+            rates = rewards_obj.get("rates")
+            if rates:
+                if isinstance(rates, list):
+                    for r in rates:
+                        if isinstance(r, dict):
+                            # Try all known key variations
+                            for key in ["rewards_daily_rate", "rewardsDailyRate",
+                                        "daily_rate", "dailyRate", "rate"]:
+                                val = r.get(key, 0)
+                                try:
+                                    v = float(val)
+                                    if v > 0:
+                                        total += v
+                                        break
+                                except (ValueError, TypeError):
+                                    pass
+                elif isinstance(rates, (int, float)):
+                    total = float(rates)
+                elif isinstance(rates, str):
+                    try:
+                        total = float(rates)
+                    except (ValueError, TypeError):
+                        pass
+        if total > 0:
+            return total
+
+        # If we got here with a market that has rewards.rates populated,
+        # it has rewards but we can't parse the amount — return 1.0 as minimum
+        if isinstance(rewards_obj, dict) and rewards_obj.get("rates"):
+            return 1.0
 
         return 0.0
 
