@@ -568,16 +568,17 @@ class MarketScanner:
                 real_yes_bid = 0.0
                 real_yes_ask = 0.0
 
-                # Find highest bid that's > 0.10 (ignore dust bids at 0.001)
+                # Find highest bid that's meaningfully near center (> 0.25)
+                # Bids at $0.10 are edge bets, not real LP near midpoint
                 for b in yes_bids:
                     p = float(b["price"])
-                    if p >= 0.10:
+                    if p >= 0.25:
                         real_yes_bid = p
                         break
-                # Find lowest ask that's < 0.90 (ignore asks at 0.999)
+                # Find lowest ask that's meaningfully near center (< 0.75)
                 for a in yes_asks:
                     p = float(a["price"])
-                    if p <= 0.90:
+                    if p <= 0.75:
                         real_yes_ask = p
                         break
 
@@ -630,12 +631,12 @@ class MarketScanner:
                 no_best_ask = 0.0
                 for b in book_no.get("bids", []):
                     p = float(b["price"])
-                    if p >= 0.10:
+                    if p >= 0.25:
                         no_best_bid = p
                         break
                 for a in book_no.get("asks", []):
                     p = float(a["price"])
-                    if p <= 0.90:
+                    if p <= 0.75:
                         no_best_ask = p
                         break
 
