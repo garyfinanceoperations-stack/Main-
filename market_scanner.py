@@ -143,54 +143,13 @@ class MarketScanner:
             if has_gamma_hint:
                 candidates.append((cid, m))
 
-        log.info(f"Gamma reward hints: {len(candidates)} markets — verifying with CLOB API...")
-
-        # Step 3: Verify with CLOB individual lookups (parallel, only ~200 not 800)
-        reward_markets = []
-        checked = 0
-
-        def _check_rewards(item):
-            cid, gamma_m = item
-            try:
-                resp = self._session.get(
-                    f"{self.clob_url}/markets/{cid}",
-                    timeout=10,
-                )
-                if resp.status_code == 200:
-                    clob_data = resp.json()
-                    rewards = clob_data.get("rewards", {})
-                    if isinstance(rewards, dict) and rewards.get("rates"):
-                        merged = {**gamma_m, **clob_data}
-                        merged["rewards"] = rewards
-                        # Preserve gamma fields that CLOB may overwrite/lack
-                        for key in ["question", "volume", "volume24hr", "clobRewards"]:
-                            if key in gamma_m and gamma_m[key]:
-                                merged[key] = gamma_m[key]
-                        return merged
-            except Exception:
-                pass
-            # Fallback: return gamma data with clobRewards as reward source
-            return gamma_m
-
-        BATCH_SIZE = 16
-        for i in range(0, len(candidates), BATCH_SIZE):
-            batch = candidates[i:i + BATCH_SIZE]
-            with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
-                futures = [pool.submit(_check_rewards, item) for item in batch]
-                for f in as_completed(futures):
-                    try:
-                        result = f.result()
-                        if result:
-                            reward_markets.append(result)
-                    except Exception:
-                        pass
-            checked += len(batch)
-            if checked % 50 == 0 or i + BATCH_SIZE >= len(candidates):
-                log.info(f"  ...verified {checked}/{len(candidates)}, "
-                         f"{len(reward_markets)} confirmed with rewards...")
+        # Use Gamma clobRewards directly — no CLOB verification needed.
+        # Gamma clobRewards.rewardsDailyRate > 0 is already a reliable signal
+        # that matches the polymarket.com/rewards page. Skipping CLOB saves ~15s.
+        reward_markets = [gamma_m for (cid, gamma_m) in candidates]
 
         log.info(f"Reward check done: {len(reward_markets)} markets with rewards "
-                 f"(from {checked} candidates)")
+                 f"(from Gamma clobRewards, no CLOB verification)")
         return reward_markets
 
     def _has_rewards(self, market: dict) -> bool:
@@ -709,7 +668,7 @@ class MarketScanner:
                     log.info(
                         f"  [{tag}] mid:{mid:.2f} | spread:{spread:.3f} | "
                         f"depth:${max_depth_usd:.0f}/{max_shares:.0f}sh | "
-                        f"share:{share:.0%} | reward:${reward_amount:.0f} | "
+                        f"share:{share:.0%} | reward:${reward_amount:.2f} | "
                         f"{question[:50]}"
                     )
 

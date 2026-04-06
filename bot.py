@@ -41,6 +41,8 @@ class PolymarketLPBot:
 
         # Active markets we're providing liquidity to
         self.active_markets: dict[str, dict] = {}  # condition_id -> market info
+        # Markets we've committed capital to (survive cap check)
+        self.funded_markets: set = set()
 
         # Graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -285,42 +287,41 @@ class PolymarketLPBot:
             try:
                 cycle_start = time.time()
 
-                # Only place/refresh orders if cap not reached
-                if not self.cap_reached:
-                    # Full market scan periodically
-                    if scan_counter % FULL_SCAN_EVERY == 0:
-                        log.info("--- Full market scan ---")
-                        markets = self.scan_and_select_markets()
-                        if markets:
-                            self.refresh_quotes(markets)
-                            self._update_spending()
-                    # Don't do quick-refresh cycles when spending cap is active
-                    # The first placement is enough — no need to cancel+repost
-                    elif self.spending_cap <= 0:
-                        # Quick refresh: just update quotes for existing markets
-                        existing = [
-                            info["market"]
-                            for info in self.active_markets.values()
-                        ]
-                        if existing:
-                            refreshed = []
-                            for m in existing:
-                                book_yes = self.scanner.get_orderbook(m.token_yes)
-                                book_no = self.scanner.get_orderbook(m.token_no)
-                                yes_bids = book_yes.get("bids", [])
-                                yes_asks = book_yes.get("asks", [])
-                                if yes_bids and yes_asks:
-                                    m.yes_bid = float(yes_bids[0]["price"])
-                                    m.yes_ask = float(yes_asks[0]["price"])
-                                    m.midpoint = (m.yes_bid + m.yes_ask) / 2
-                                    m.spread = m.yes_ask - m.yes_bid
-                                refreshed.append(m)
-                                time.sleep(0.1)
-                            self.refresh_quotes(refreshed)
-                            self._update_spending()
-                else:
-                    if scan_counter % 5 == 0:
-                        log.info(f"Spending cap reached (${self.total_spent:.2f}/${self.spending_cap:.2f}) - monitoring only, no new orders")
+                # === Scanning for NEW markets (only if cap not reached) ===
+                if not self.cap_reached and scan_counter % FULL_SCAN_EVERY == 0:
+                    log.info("--- Full market scan ---")
+                    markets = self.scan_and_select_markets()
+                    if markets:
+                        self.refresh_quotes(markets)
+                        # Track these as funded markets so they get refreshed even after cap
+                        for m in markets:
+                            self.funded_markets.add(m.condition_id)
+                        self._update_spending()
+                elif self.cap_reached and scan_counter % 5 == 0:
+                    log.info(f"Spending cap reached (${self.total_spent:.2f}/${self.spending_cap:.2f}) - no NEW markets, still refreshing existing")
+
+                # === ALWAYS refresh existing markets for max Q score ===
+                # Cancel+repost orders every cycle to track midpoint movement
+                if scan_counter % FULL_SCAN_EVERY != 0:  # skip on full-scan cycles (already refreshed)
+                    existing = [
+                        info["market"]
+                        for info in self.active_markets.values()
+                    ]
+                    if existing:
+                        refreshed = []
+                        for m in existing:
+                            book_yes = self.scanner.get_orderbook(m.token_yes)
+                            book_no = self.scanner.get_orderbook(m.token_no)
+                            yes_bids = book_yes.get("bids", [])
+                            yes_asks = book_yes.get("asks", [])
+                            if yes_bids and yes_asks:
+                                m.yes_bid = float(yes_bids[0]["price"])
+                                m.yes_ask = float(yes_asks[0]["price"])
+                                m.midpoint = (m.yes_bid + m.yes_ask) / 2
+                                m.spread = m.yes_ask - m.yes_bid
+                            refreshed.append(m)
+                            time.sleep(0.1)
+                        self.refresh_quotes(refreshed)
 
                 # Always run risk checks
                 self.check_risk_and_act()
@@ -414,7 +415,7 @@ def run_simulation(config: BotConfig):
     for i, m in enumerate(selected):
         log.info(f"  [{i+1}] {m.question}")
         log.info(f"      Condition: {m.condition_id[:24]}...")
-        log.info(f"      Reward: ${m.reward_pool:.2f}/day | Score: {m.our_share_estimate:.2%}")
+        log.info(f"      Reward: ${m.reward_pool:.2f}/day | Score: {m.our_share_estimate:.2%}")  # .2f shows sub-$1 rates
         log.info(f"      Midpoint: {m.midpoint:.4f} | Spread: {m.spread:.4f}")
         log.info(f"      YES bid/ask: {m.yes_bid:.4f}/{m.yes_ask:.4f}")
         log.info(f"      NO  bid/ask: {m.no_bid:.4f}/{m.no_ask:.4f}")
