@@ -20,6 +20,8 @@ class OrderManager:
         self.client: ClobClient = None
         self.api_creds = None
         self.active_orders: dict[str, dict] = {}  # order_id -> order info
+        # Maps condition_id -> {"token_yes": ..., "token_no": ...} for fill detection
+        self.market_tokens: dict[str, dict] = {}
         self._initialize_client()
 
     def _initialize_client(self):
@@ -118,6 +120,73 @@ class OrderManager:
             log.error(f"Error fetching open orders: {e}")
             return []
 
+    def detect_fills(self) -> list[dict]:
+        """
+        Compare tracked orders against API open orders.
+        Any tracked order NOT in the API = filled.
+        Records fills in risk manager and returns fill list.
+        """
+        fills = []
+        if not self.active_orders:
+            return fills
+
+        # Get actually open orders from the API
+        try:
+            open_orders = self.get_open_orders()
+            open_ids = set()
+            for o in open_orders:
+                oid = o.get("id", o.get("orderID", o.get("order_id", "")))
+                if oid:
+                    open_ids.add(oid)
+        except Exception as e:
+            log.debug(f"Error checking open orders: {e}")
+            return fills
+
+        # Any tracked order NOT in open_ids = filled
+        filled_ids = []
+        for oid, info in list(self.active_orders.items()):
+            if oid not in open_ids:
+                filled_ids.append(oid)
+                fill_price = info["price"]
+                fill_size = info["size"]
+                token_id = info["token_id"]
+                condition_id = info["condition_id"]
+
+                # Determine YES vs NO from stored token mapping
+                side = "YES"
+                tokens = self.market_tokens.get(condition_id, {})
+                if tokens.get("token_no") == token_id:
+                    side = "NO"
+
+                log.warning(
+                    f"FILL DETECTED: {side} {info['side']} {fill_size:.2f} shares @ ${fill_price:.4f} "
+                    f"(${info['cost_usd']:.2f}) — order {oid[:16]} no longer on book"
+                )
+
+                # Record the fill so risk manager tracks the position
+                if info["side"] == "BUY":
+                    self.risk.record_fill(
+                        condition_id, token_id, side,
+                        fill_price, fill_size, oid,
+                    )
+
+                fills.append({
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "side": side,
+                    "price": fill_price,
+                    "size": fill_size,
+                })
+
+        # Remove filled orders from tracking
+        for oid in filled_ids:
+            self.active_orders.pop(oid, None)
+
+        if fills:
+            log.warning(f"Total fills detected: {len(fills)} orders filled")
+
+        return fills
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order."""
         try:
@@ -151,7 +220,9 @@ class OrderManager:
             return 0
 
     def cancel_market_orders(self, condition_id: str) -> int:
-        """Cancel all orders for a specific market."""
+        """Cancel all orders for a specific market.
+        Only removes orders from tracking if cancel succeeds.
+        Failed cancels (likely already filled) stay in tracking for detect_fills."""
         cancelled = 0
         to_cancel = [
             (oid, info) for oid, info in self.active_orders.items()
@@ -165,7 +236,8 @@ class OrderManager:
                 self.active_orders.pop(oid, None)
                 cancelled += 1
             except Exception as e:
-                log.error(f"Failed to cancel order {oid[:16]}: {e}")
+                # Don't remove from active_orders — detect_fills will handle it
+                log.debug(f"Cancel failed for {oid[:16]} (likely filled): {e}")
         return cancelled
 
     def place_limit_order(self, token_id: str, side: str, price: float,
@@ -250,6 +322,12 @@ class OrderManager:
         order_ids = []
         midpoint = market.midpoint
         lp = learned_params or {}
+
+        # Store token mapping for fill detection
+        self.market_tokens[market.condition_id] = {
+            "token_yes": market.token_yes,
+            "token_no": market.token_no,
+        }
 
         min_edge = lp.get("min_edge", self.config.min_edge)
         max_edge = lp.get("max_edge", self.config.max_edge)

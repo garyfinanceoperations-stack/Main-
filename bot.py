@@ -317,6 +317,22 @@ class PolymarketLPBot:
             try:
                 cycle_start = time.time()
 
+                # === FIRST: detect any fills before doing anything else ===
+                # This ensures positions are recorded so we don't place duplicate BUYs
+                if self.orders and not self.dry_run:
+                    fills = self.orders.detect_fills()
+                    if fills:
+                        for fill in fills:
+                            # Place SELL orders for filled positions
+                            sell_price = round(fill["price"] + self.config.min_edge, 4)
+                            sell_price = max(0.02, min(0.99, sell_price))
+                            if fill["size"] > 0:
+                                log.info(f"  Placing SELL to exit: {fill['side']} {fill['size']:.2f} @ ${sell_price:.4f}")
+                                self.orders.place_limit_order(
+                                    fill["token_id"], "SELL", sell_price, fill["size"],
+                                    fill["condition_id"],
+                                )
+
                 # === Scanning for NEW markets (only if cap not reached) ===
                 if not self.cap_reached and scan_counter % FULL_SCAN_EVERY == 0:
                     log.info("--- Full market scan ---")
