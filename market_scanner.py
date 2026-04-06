@@ -602,6 +602,10 @@ class MarketScanner:
                 if real_yes_bid > 0 and real_yes_ask > 0:
                     mid = (real_yes_bid + real_yes_ask) / 2
                     spread = real_yes_ask - real_yes_bid
+                    # If the gap between nearest orders is huge (> 20c),
+                    # the center is effectively empty — we'd be the only LP there
+                    if spread > 0.20:
+                        center_is_empty = True
                 elif real_yes_bid > 0:
                     mid = real_yes_bid + 0.02
                     spread = 0.04
@@ -618,9 +622,6 @@ class MarketScanner:
 
                 if mid < 0.40 or mid > 0.60:
                     stats["bad_midpoint"] += 1
-                    if stats["bad_midpoint"] <= 5:
-                        log.debug(f"  SKIP midpoint={mid:.2f}: bid={real_yes_bid} ask={real_yes_ask} "
-                                  f"empty={center_is_empty} | {question[:40]}")
                     continue
 
                 no_mid = 1.0 - mid
@@ -686,9 +687,6 @@ class MarketScanner:
 
                 if not spread_ok:
                     stats["bad_spread"] += 1
-                    if stats["bad_spread"] <= 5:
-                        log.info(f"  SKIP spread={spread:.3f} mid={mid:.2f} empty={center_is_empty} "
-                                 f"bid={real_yes_bid} ask={real_yes_ask} | {question[:40]}")
                     continue
 
                 if center_is_empty:
