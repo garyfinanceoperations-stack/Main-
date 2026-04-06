@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -156,6 +157,13 @@ class PolymarketLPBot:
 
                 time.sleep(0.2)
 
+                # Check spending cap: only allow NEW markets if cap not reached
+                # Existing funded markets can always refresh
+                is_new = market.condition_id not in self.funded_markets
+                if is_new and self.cap_reached:
+                    log.info(f"  Skipping new market {market.condition_id[:16]} — spending cap reached")
+                    continue
+
                 # Place fresh two-sided quotes with learned adjustments
                 order_ids = self.orders.place_lp_quotes(
                     market, learned_params=learned
@@ -167,28 +175,28 @@ class PolymarketLPBot:
                         "order_ids": order_ids,
                         "last_refresh": time.time(),
                     }
+                    # Track spending for new markets only (refreshes don't add net exposure)
+                    if is_new:
+                        cost = sum(
+                            self.orders.active_orders[oid].get("cost_usd", 0)
+                            for oid in order_ids if oid in self.orders.active_orders
+                        )
+                        self._track_order_cost(cost)
+                        self.funded_markets.add(market.condition_id)
 
             except Exception as e:
                 log.error(f"Error refreshing quotes for {market.condition_id[:16]}: {e}")
 
-    def _update_spending(self):
-        """Track total USD in open orders and check against spending cap.
-        Uses the current active orders total — once we've placed our first
-        batch of orders, we set cap_reached so the bot stops placing more.
-        """
-        if self.spending_cap <= 0 or not self.orders:
+    def _track_order_cost(self, cost_usd: float):
+        """Add to cumulative spending total. Called every time an order is placed."""
+        if self.spending_cap <= 0:
             return
-        current_orders_usd = sum(
-            info.get("cost_usd", info.get("price", 0) * info.get("size", 0))
-            for info in self.orders.active_orders.values()
-        )
-        # Track the high-water mark of spending
-        self.total_spent = max(self.total_spent, current_orders_usd)
-        if self.total_spent >= self.spending_cap:
+        self.total_spent += cost_usd
+        if self.total_spent >= self.spending_cap and not self.cap_reached:
             self.cap_reached = True
-            log.info(
+            log.warning(
                 f"SPENDING CAP REACHED: ${self.total_spent:.2f} / ${self.spending_cap:.2f}. "
-                f"No more orders will be placed. Monitoring positions and risk."
+                f"No NEW markets. Existing markets still refresh."
             )
 
     def check_risk_and_act(self):
@@ -315,10 +323,6 @@ class PolymarketLPBot:
                     markets = self.scan_and_select_markets()
                     if markets:
                         self.refresh_quotes(markets)
-                        # Track these as funded markets so they get refreshed even after cap
-                        for m in markets:
-                            self.funded_markets.add(m.condition_id)
-                        self._update_spending()
                 elif self.cap_reached and scan_counter % 5 == 0:
                     log.info(f"Spending cap reached (${self.total_spent:.2f}/${self.spending_cap:.2f}) - no NEW markets, still refreshing existing")
 
@@ -723,15 +727,18 @@ def main():
         return
 
     if args.live_test:
-        # Override config for safe $50 test
+        # Override config — respect .env risk limits, just add spending cap
         config.order_size = 10.0
         config.num_price_levels = 1
         config.max_active_markets = 3
-        config.max_exposure_per_market = 50.0
-        config.max_loss_per_position = 5.0
-        config.emergency_loss_threshold = 10.0
-        config.portfolio_stop_loss = 25.0
-        log.info("LIVE TEST: $50 cap | up to 3 markets | $5 max loss | $25 stop-loss")
+        config.max_exposure_per_market = float(os.getenv("MAX_EXPOSURE_PER_MARKET", "20"))
+        config.max_loss_per_position = float(os.getenv("MAX_LOSS_PER_POSITION", "3"))
+        config.emergency_loss_threshold = float(os.getenv("EMERGENCY_LOSS_THRESHOLD", "8"))
+        config.portfolio_stop_loss = float(os.getenv("PORTFOLIO_STOP_LOSS", "15"))
+        log.info(f"LIVE TEST: $50 cap | up to 3 markets | "
+                 f"${config.max_exposure_per_market:.0f} max/market | "
+                 f"${config.max_loss_per_position:.0f} max loss | "
+                 f"${config.portfolio_stop_loss:.0f} stop-loss")
         bot = PolymarketLPBot(config, spending_cap=50.0)
     else:
         bot = PolymarketLPBot(config, dry_run=args.dry_run)
