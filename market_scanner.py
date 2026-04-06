@@ -583,17 +583,17 @@ class MarketScanner:
                 real_yes_bid = 0.0
                 real_yes_ask = 0.0
 
-                # Find highest bid that's meaningfully near center (> 0.25)
+                # Find highest bid that's meaningfully near center (> 0.20)
                 # Bids at $0.10 are edge bets, not real LP near midpoint
                 for b in yes_bids:
                     p = float(b["price"])
-                    if p >= 0.25:
+                    if p >= 0.20:
                         real_yes_bid = p
                         break
-                # Find lowest ask that's meaningfully near center (< 0.75)
+                # Find lowest ask that's meaningfully near center (< 0.80)
                 for a in yes_asks:
                     p = float(a["price"])
-                    if p <= 0.75:
+                    if p <= 0.80:
                         real_yes_ask = p
                         break
 
@@ -618,6 +618,9 @@ class MarketScanner:
 
                 if mid < 0.40 or mid > 0.60:
                     stats["bad_midpoint"] += 1
+                    if stats["bad_midpoint"] <= 5:
+                        log.debug(f"  SKIP midpoint={mid:.2f}: bid={real_yes_bid} ask={real_yes_ask} "
+                                  f"empty={center_is_empty} | {question[:40]}")
                     continue
 
                 no_mid = 1.0 - mid
@@ -646,12 +649,12 @@ class MarketScanner:
                 no_best_ask = 0.0
                 for b in book_no.get("bids", []):
                     p = float(b["price"])
-                    if p >= 0.25:
+                    if p >= 0.20:
                         no_best_bid = p
                         break
                 for a in book_no.get("asks", []):
                     p = float(a["price"])
-                    if p <= 0.75:
+                    if p <= 0.80:
                         no_best_ask = p
                         break
 
@@ -683,6 +686,9 @@ class MarketScanner:
 
                 if not spread_ok:
                     stats["bad_spread"] += 1
+                    if stats["bad_spread"] <= 5:
+                        log.info(f"  SKIP spread={spread:.3f} mid={mid:.2f} empty={center_is_empty} "
+                                 f"bid={real_yes_bid} ask={real_yes_ask} | {question[:40]}")
                     continue
 
                 if center_is_empty:
