@@ -250,19 +250,29 @@ class OrderManager:
         """
         cost_usd = price * size
 
-        # HARD CAP: count total $ in ALL currently tracked BUY orders
-        # This prevents overexposure regardless of cancel/refresh cycles
+        # HARD CAP: count open BUY orders + held positions (filled orders)
+        # New BUYs blocked until positions are sold — sell first, then buy
         if side == "BUY" and self.hard_cap > 0:
-            current_buy_total = sum(
+            # $ in open BUY orders
+            open_buys = sum(
                 info.get("cost_usd", 0)
                 for info in self.active_orders.values()
                 if info.get("side") == "BUY"
             )
-            if current_buy_total + cost_usd > self.hard_cap:
+            # $ in held positions (filled BUYs not yet sold)
+            position_cost = 0.0
+            for exp in self.risk.exposures.values():
+                if exp.yes_position and exp.yes_position.size > 0:
+                    position_cost += exp.yes_position.cost_basis
+                if exp.no_position and exp.no_position.size > 0:
+                    position_cost += exp.no_position.cost_basis
+
+            total_committed = open_buys + position_cost
+            if total_committed + cost_usd > self.hard_cap:
                 log.warning(
-                    f"HARD CAP: ${current_buy_total:.2f} open + ${cost_usd:.2f} new "
-                    f"= ${current_buy_total + cost_usd:.2f} > ${self.hard_cap:.2f} cap. "
-                    f"Order blocked."
+                    f"HARD CAP: ${open_buys:.2f} open + ${position_cost:.2f} positions "
+                    f"+ ${cost_usd:.2f} new = ${total_committed + cost_usd:.2f} > "
+                    f"${self.hard_cap:.2f}. Must sell positions first."
                 )
                 return None
 

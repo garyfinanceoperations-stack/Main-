@@ -351,10 +351,16 @@ class PolymarketLPBot:
                         1 for info in self.orders.active_orders.values()
                         if info.get("side") == "SELL"
                     )
+                    position_cost = 0.0
+                    for exp in self.risk.exposures.values():
+                        if exp.yes_position and exp.yes_position.size > 0:
+                            position_cost += exp.yes_position.cost_basis
+                        if exp.no_position and exp.no_position.size > 0:
+                            position_cost += exp.no_position.cost_basis
                     log.info(
-                        f"  Open orders: {len(self.orders.active_orders)} "
-                        f"(BUY ${buy_total:.2f} | {sell_count} SELLs) | "
-                        f"Cap: ${self.spending_cap:.2f}"
+                        f"  Exposure: ${buy_total:.2f} open BUYs + ${position_cost:.2f} positions "
+                        f"= ${buy_total + position_cost:.2f} / ${self.spending_cap:.2f} cap | "
+                        f"{sell_count} SELLs pending"
                     )
 
                 # Always run risk checks
