@@ -255,10 +255,45 @@ class OrderManager:
         max_edge = lp.get("max_edge", self.config.max_edge)
         size_mult = lp.get("order_size_multiplier", 1.0)
 
+        # Check if we already hold positions — if so, only place SELL orders
+        exposure = self.risk.exposures.get(market.condition_id)
+        has_yes_position = exposure and exposure.yes_position and exposure.yes_position.size > 0
+        has_no_position = exposure and exposure.no_position and exposure.no_position.size > 0
+
+        # === SELL orders first for any existing positions (exit + score rewards) ===
+        if has_yes_position:
+            mid = midpoint
+            sell_price = round(mid + min_edge, 4)
+            sell_price = max(0.02, min(0.99, sell_price))
+            log.info(f"  YES SELL: {exposure.yes_position.size:.0f} shares @ ${sell_price:.4f} "
+                     f"(exit position)")
+            oid = self.place_limit_order(
+                market.token_yes, "SELL", sell_price, exposure.yes_position.size,
+                market.condition_id,
+            )
+            if oid:
+                order_ids.append(oid)
+            time.sleep(0.1)
+
+        if has_no_position:
+            no_mid = 1 - midpoint
+            sell_price = round(no_mid + min_edge, 4)
+            sell_price = max(0.02, min(0.99, sell_price))
+            log.info(f"  NO  SELL: {exposure.no_position.size:.0f} shares @ ${sell_price:.4f} "
+                     f"(exit position)")
+            oid = self.place_limit_order(
+                market.token_no, "SELL", sell_price, exposure.no_position.size,
+                market.condition_id,
+            )
+            if oid:
+                order_ids.append(oid)
+            time.sleep(0.1)
+
+        # === BUY orders only if we do NOT already hold a position on that side ===
+        # If we hold shares, we don't want MORE — just the SELL to exit
         # For fallback markets or wide spreads: post 1c better than best order
         use_undercut = market.is_fallback or market.spread > 0.06
 
-        # Calculate price levels
         for level in range(self.config.num_price_levels):
             edge = (
                 min_edge
@@ -266,119 +301,82 @@ class OrderManager:
                 * level / max(1, self.config.num_price_levels - 1)
             )
 
-            # Ensure edge is within the market's max spread for rewards
             if edge > market.max_spread:
                 log.debug(f"Skipping level {level}: edge {edge:.4f} > max_spread {market.max_spread:.4f}")
                 continue
 
-            # Size: ensure we meet min_size (in shares) for reward eligibility
-            # but never exceed exposure cap per side
             max_per_side = self.config.max_exposure_per_market / 2
 
-            # === YES side ===
-            if use_undercut and market.yes_bid > 0:
-                # Post 1 cent better than the current best bid
-                # But only if the bid is within 15c of midpoint (ignore dust bids)
-                if abs(market.yes_bid - midpoint) <= 0.15:
-                    yes_bid_price = round(market.yes_bid + 0.01, 4)
+            # === YES BUY (only if no existing YES position) ===
+            if not has_yes_position:
+                if use_undercut and market.yes_bid > 0:
+                    if abs(market.yes_bid - midpoint) <= 0.15:
+                        yes_bid_price = round(market.yes_bid + 0.01, 4)
+                    else:
+                        yes_bid_price = round(midpoint - edge, 4)
                 else:
                     yes_bid_price = round(midpoint - edge, 4)
-            else:
-                yes_bid_price = round(midpoint - edge, 4)
+                yes_bid_price = max(0.01, min(0.99, yes_bid_price))
 
-            yes_ask_price = round(midpoint + edge, 4)
-
-            # Clamp prices to valid range
-            yes_bid_price = max(0.01, min(0.99, yes_bid_price))
-            yes_ask_price = max(0.01, min(0.99, yes_ask_price))
-
-            # Calculate YES shares: at least min_size, capped by exposure limit
-            shares_yes_bid = max(market.min_size, round(self.config.order_size / yes_bid_price, 2)) if yes_bid_price > 0 else 0
-            yes_cost = shares_yes_bid * yes_bid_price
-            # Cap by exposure limit
-            if yes_cost > max_per_side:
-                shares_yes_bid = round(max_per_side / yes_bid_price, 2)
+                shares_yes_bid = max(market.min_size, round(self.config.order_size / yes_bid_price, 2)) if yes_bid_price > 0 else 0
                 yes_cost = shares_yes_bid * yes_bid_price
-            # Skip if we can't meet min shares within budget
-            if shares_yes_bid < market.min_size:
-                log.warning(f"  YES: can't meet {market.min_size:.0f} min shares within ${max_per_side:.0f} budget, skipping")
-                shares_yes_bid = 0
+                if yes_cost > max_per_side:
+                    shares_yes_bid = round(max_per_side / yes_bid_price, 2)
+                    yes_cost = shares_yes_bid * yes_bid_price
+                if shares_yes_bid < market.min_size:
+                    log.warning(f"  YES: can't meet {market.min_size:.0f} min shares within ${max_per_side:.0f} budget, skipping")
+                    shares_yes_bid = 0
 
-            if shares_yes_bid > 0:
-                log.info(f"  YES: {shares_yes_bid:.0f} shares @ ${yes_bid_price:.4f} = ${yes_cost:.2f} "
-                         f"(min: {market.min_size:.0f} shares)")
-                oid = self.place_limit_order(
-                    market.token_yes, "BUY", yes_bid_price, shares_yes_bid, market.condition_id
-                )
-                if oid:
-                    order_ids.append(oid)
-                time.sleep(0.1)
-
-            # === NO side ===
-            no_mid = 1 - midpoint
-            if use_undercut and market.no_bid > 0:
-                # Only undercut if bid is within 15c of NO midpoint (ignore dust bids)
-                if abs(market.no_bid - no_mid) <= 0.15:
-                    no_bid_price = round(market.no_bid + 0.01, 4)
-                else:
-                    no_bid_price = round(no_mid - edge, 4)
-            else:
-                no_bid_price = round(no_mid - edge, 4)
-            no_ask_price = round((1 - midpoint) + edge, 4)
-            no_bid_price = max(0.01, min(0.99, no_bid_price))
-            no_ask_price = max(0.01, min(0.99, no_ask_price))
-
-            # Safety: YES bid + NO bid must be <= $0.98 (2c gap minimum)
-            if yes_bid_price + no_bid_price > 0.98:
-                # Scale both down equally to maintain gap
-                excess = (yes_bid_price + no_bid_price) - 0.98
-                yes_bid_price = round(yes_bid_price - excess / 2, 4)
-                no_bid_price = round(no_bid_price - excess / 2, 4)
-                log.debug(f"Adjusted prices for 2c gap: YES={yes_bid_price} NO={no_bid_price}")
-
-            # Calculate NO shares: at least min_size, capped by exposure limit
-            shares_no_bid = max(market.min_size, round(self.config.order_size / no_bid_price, 2)) if no_bid_price > 0 else 0
-            no_cost = shares_no_bid * no_bid_price
-            # Cap by exposure limit
-            if no_cost > max_per_side:
-                shares_no_bid = round(max_per_side / no_bid_price, 2)
-                no_cost = shares_no_bid * no_bid_price
-            # Skip if we can't meet min shares within budget
-            if shares_no_bid < market.min_size:
-                log.warning(f"  NO: can't meet {market.min_size:.0f} min shares within ${max_per_side:.0f} budget, skipping")
-                shares_no_bid = 0
-
-            if shares_no_bid > 0:
-                log.info(f"  NO:  {shares_no_bid:.0f} shares @ ${no_bid_price:.4f} = ${no_cost:.2f} "
-                         f"(min: {market.min_size:.0f} shares)")
-                oid = self.place_limit_order(
-                    market.token_no, "BUY", no_bid_price, shares_no_bid, market.condition_id
-                )
-                if oid:
-                    order_ids.append(oid)
-                time.sleep(0.1)
-
-        # === SELL orders for any existing positions (exit + score rewards) ===
-        exposure = self.risk.exposures.get(market.condition_id)
-        if exposure:
-            midpoint = market.midpoint
-            for side_name, position, token_id in [
-                ("YES", exposure.yes_position, market.token_yes),
-                ("NO", exposure.no_position, market.token_no),
-            ]:
-                if position and position.size > 0:
-                    # Sell at midpoint + edge to exit while scoring rewards
-                    mid = midpoint if side_name == "YES" else (1 - midpoint)
-                    sell_price = round(mid + min_edge, 4)
-                    sell_price = max(0.02, min(0.99, sell_price))
-                    log.info(f"  {side_name} SELL: {position.size:.0f} shares @ ${sell_price:.4f} "
-                             f"(exit position)")
+                if shares_yes_bid > 0:
+                    log.info(f"  YES BUY: {shares_yes_bid:.0f} shares @ ${yes_bid_price:.4f} = ${yes_cost:.2f} "
+                             f"(min: {market.min_size:.0f} shares)")
                     oid = self.place_limit_order(
-                        token_id, "SELL", sell_price, position.size, market.condition_id
+                        market.token_yes, "BUY", yes_bid_price, shares_yes_bid, market.condition_id
                     )
                     if oid:
                         order_ids.append(oid)
                     time.sleep(0.1)
+            else:
+                log.info(f"  YES: holding {exposure.yes_position.size:.0f} shares — BUY skipped, SELL placed")
+
+            # === NO BUY (only if no existing NO position) ===
+            if not has_no_position:
+                no_mid = 1 - midpoint
+                if use_undercut and market.no_bid > 0:
+                    if abs(market.no_bid - no_mid) <= 0.15:
+                        no_bid_price = round(market.no_bid + 0.01, 4)
+                    else:
+                        no_bid_price = round(no_mid - edge, 4)
+                else:
+                    no_bid_price = round(no_mid - edge, 4)
+                no_bid_price = max(0.01, min(0.99, no_bid_price))
+
+                # Safety: YES bid + NO bid must be <= $0.98
+                if not has_yes_position and 'yes_bid_price' in dir():
+                    if yes_bid_price + no_bid_price > 0.98:
+                        excess = (yes_bid_price + no_bid_price) - 0.98
+                        no_bid_price = round(no_bid_price - excess, 4)
+
+                shares_no_bid = max(market.min_size, round(self.config.order_size / no_bid_price, 2)) if no_bid_price > 0 else 0
+                no_cost = shares_no_bid * no_bid_price
+                if no_cost > max_per_side:
+                    shares_no_bid = round(max_per_side / no_bid_price, 2)
+                    no_cost = shares_no_bid * no_bid_price
+                if shares_no_bid < market.min_size:
+                    log.warning(f"  NO: can't meet {market.min_size:.0f} min shares within ${max_per_side:.0f} budget, skipping")
+                    shares_no_bid = 0
+
+                if shares_no_bid > 0:
+                    log.info(f"  NO  BUY: {shares_no_bid:.0f} shares @ ${no_bid_price:.4f} = ${no_cost:.2f} "
+                             f"(min: {market.min_size:.0f} shares)")
+                    oid = self.place_limit_order(
+                        market.token_no, "BUY", no_bid_price, shares_no_bid, market.condition_id
+                    )
+                    if oid:
+                        order_ids.append(oid)
+                    time.sleep(0.1)
+            else:
+                log.info(f"  NO: holding {exposure.no_position.size:.0f} shares — BUY skipped, SELL placed")
 
         log.info(
             f"Placed {len(order_ids)} LP orders for market {market.condition_id[:16]} "

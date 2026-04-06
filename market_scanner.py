@@ -472,7 +472,7 @@ class MarketScanner:
         stats = {
             "no_tokens": 0, "no_reward": 0, "bad_midpoint": 0, "too_thick": 0,
             "bad_spread": 0, "low_share": 0, "checked": 0,
-            "fallback": 0, "total": len(all_markets),
+            "fallback": 0, "empty_book": 0, "total": len(all_markets),
         }
 
         for market in all_markets:
@@ -481,7 +481,7 @@ class MarketScanner:
                 stats["no_tokens"] += 1
                 continue
             reward_amount = self._get_reward_amount(market)
-            if reward_amount < 0.50:
+            if reward_amount < 5.0:
                 stats["no_reward"] += 1
                 continue
             # Skip markets where min shares requirement exceeds our budget
@@ -618,9 +618,16 @@ class MarketScanner:
                         no_best_ask = p
                         break
 
-                # Set defaults for empty/center-empty books
-                book_is_empty = center_is_empty and yes_best_bid == 0 and yes_best_ask == 0
-                if book_is_empty or center_is_empty:
+                # SKIP truly empty books — no orders at all means our BUY orders
+                # become the only liquidity and fill instantly against any seller.
+                # We need existing orders on the book to hide among.
+                book_is_empty = (len(yes_bids) == 0 and len(yes_asks) == 0)
+                if book_is_empty:
+                    stats["empty_book"] += 1
+                    continue
+
+                # Set defaults for center-empty books (orders exist at edges but not near mid)
+                if center_is_empty:
                     if yes_best_bid == 0:
                         yes_best_bid = mid - 0.02
                     if yes_best_ask == 0:
@@ -710,6 +717,7 @@ class MarketScanner:
             f"Skipped: {stats['no_tokens']} no tokens, "
             f"{stats['no_reward']} no/low reward, "
             f"{stats['bad_midpoint']} bad midpoint, "
+            f"{stats['empty_book']} empty book, "
             f"{stats['too_thick']} too thick, "
             f"{stats['bad_spread']} bad spread | "
             f"Checked {stats['checked']} books"
