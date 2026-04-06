@@ -130,8 +130,12 @@ class RiskManager:
 
     def can_place_order(self, condition_id: str, side: str, size_usd: float) -> tuple[bool, str]:
         """Check if placing an order is allowed under risk limits."""
-        if self.emergency_mode:
+        if self.emergency_mode and side == "BUY":
             return False, "EMERGENCY MODE ACTIVE - no new orders"
+
+        # SELL orders always allowed — they reduce exposure, not increase it
+        if side == "SELL":
+            return True, "OK"
 
         exposure = self.exposures.get(condition_id, MarketExposure(condition_id=condition_id))
 

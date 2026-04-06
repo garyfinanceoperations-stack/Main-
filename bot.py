@@ -206,7 +206,7 @@ class PolymarketLPBot:
             except Exception:
                 pass
 
-        # Sync any fills and feed to learner
+        # Sync any fills and feed to learner + place SELL orders to exit
         try:
             fills = self.orders.sync_fills()
             if fills:
@@ -216,6 +216,21 @@ class PolymarketLPBot:
                         fill["price"], fill["size"],
                         fill.get("edge", self.config.min_edge),
                     )
+                    # Immediately place SELL order to exit the filled position
+                    # Sell at midpoint + edge (slightly above where we bought)
+                    # This also scores rewards while sitting on the book
+                    sell_price = round(fill["price"] + self.config.min_edge, 4)
+                    sell_price = max(0.02, min(0.99, sell_price))
+                    token_id = fill.get("token_id")
+                    if token_id and fill["size"] > 0:
+                        log.info(
+                            f"FILL DETECTED: {fill['side']} {fill['size']:.2f} @ ${fill['price']:.4f} "
+                            f"- placing SELL @ ${sell_price:.4f} to exit"
+                        )
+                        self.orders.place_limit_order(
+                            token_id, "SELL", sell_price, fill["size"],
+                            fill["condition_id"],
+                        )
         except Exception:
             pass
 

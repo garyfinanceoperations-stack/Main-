@@ -183,7 +183,9 @@ class OrderManager:
             return None
 
         # Register pending cost so the next order in the same cycle sees it
-        self.risk.register_pending_order(condition_id, cost_usd)
+        # SELL orders don't add exposure — they reduce it
+        if side == "BUY":
+            self.risk.register_pending_order(condition_id, cost_usd)
 
         try:
             order_args = OrderArgs(
@@ -200,8 +202,8 @@ class OrderManager:
                 order_id = resp.get("orderID", resp.get("id"))
                 if resp.get("success") is False:
                     log.warning(f"Order rejected: {resp.get('errorMsg', 'unknown')}")
-                    # Unregister since order didn't go through
-                    self.risk.unregister_pending_order(condition_id, cost_usd)
+                    if side == "BUY":
+                        self.risk.unregister_pending_order(condition_id, cost_usd)
                     return None
             elif isinstance(resp, str):
                 order_id = resp
@@ -222,13 +224,14 @@ class OrderManager:
                 )
             else:
                 # No order_id returned - unregister
-                self.risk.unregister_pending_order(condition_id, cost_usd)
+                if side == "BUY":
+                    self.risk.unregister_pending_order(condition_id, cost_usd)
             return order_id
 
         except Exception as e:
             log.error(f"Failed to place order: {e}")
-            # Unregister since order failed
-            self.risk.unregister_pending_order(condition_id, cost_usd)
+            if side == "BUY":
+                self.risk.unregister_pending_order(condition_id, cost_usd)
             return None
 
     def place_lp_quotes(self, market: MarketInfo,
@@ -355,6 +358,28 @@ class OrderManager:
                     order_ids.append(oid)
                 time.sleep(0.1)
 
+        # === SELL orders for any existing positions (exit + score rewards) ===
+        exposure = self.risk.exposures.get(market.condition_id)
+        if exposure:
+            midpoint = market.midpoint
+            for side_name, position, token_id in [
+                ("YES", exposure.yes_position, market.token_yes),
+                ("NO", exposure.no_position, market.token_no),
+            ]:
+                if position and position.size > 0:
+                    # Sell at midpoint + edge to exit while scoring rewards
+                    mid = midpoint if side_name == "YES" else (1 - midpoint)
+                    sell_price = round(mid + min_edge, 4)
+                    sell_price = max(0.02, min(0.99, sell_price))
+                    log.info(f"  {side_name} SELL: {position.size:.0f} shares @ ${sell_price:.4f} "
+                             f"(exit position)")
+                    oid = self.place_limit_order(
+                        token_id, "SELL", sell_price, position.size, market.condition_id
+                    )
+                    if oid:
+                        order_ids.append(oid)
+                    time.sleep(0.1)
+
         log.info(
             f"Placed {len(order_ids)} LP orders for market {market.condition_id[:16]} "
             f"({market.question[:40]})"
@@ -467,6 +492,7 @@ class OrderManager:
                         )
                         fills.append({
                             "condition_id": info["condition_id"],
+                            "token_id": info["token_id"],
                             "side": side,
                             "price": fill_price,
                             "size": fill_size,
