@@ -97,6 +97,13 @@ class PolymarketLPBot:
         if len(markets) < before_count:
             log.info(f"Learner filtered out {before_count - len(markets)} blacklisted markets")
 
+        # Skip markets where we can't meet min_size within our per-side budget
+        max_per_side = self.config.max_exposure_per_market / 2
+        before_afford = len(markets)
+        markets = [m for m in markets if m.min_size * 0.50 <= max_per_side]
+        if len(markets) < before_afford:
+            log.info(f"Skipped {before_afford - len(markets)} markets: can't afford min_size within ${max_per_side:.0f}/side")
+
         # Re-score using learner (combines reward estimate + historical performance)
         for m in markets:
             m.our_share_estimate = self.learner.score_market(
@@ -704,12 +711,12 @@ def main():
         # Override config for safe $50 test
         config.order_size = 10.0
         config.num_price_levels = 1
-        config.max_active_markets = 1
+        config.max_active_markets = 3
         config.max_exposure_per_market = 50.0
         config.max_loss_per_position = 5.0
         config.emergency_loss_threshold = 10.0
         config.portfolio_stop_loss = 25.0
-        log.info("LIVE TEST: $50 cap | 1 market | $5 max loss | $25 stop-loss")
+        log.info("LIVE TEST: $50 cap | up to 3 markets | $5 max loss | $25 stop-loss")
         bot = PolymarketLPBot(config, spending_cap=50.0)
     else:
         bot = PolymarketLPBot(config, dry_run=args.dry_run)
