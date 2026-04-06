@@ -706,37 +706,38 @@ class MarketScanner:
                 log.debug(f"Error processing market: {e}")
                 continue
 
-        # Score markets: best = high rewards, low depth, low volume
-        # This finds markets where we earn the most rewards with least fill risk
+        # Score markets: reward is king, depth and volume are modifiers
+        # High reward = more $ earned. Low depth = bigger share. Low volume = fewer fills.
+        # But a $14/day market always beats a $6/day market unless depth/vol are extreme.
         for m in eligible:
-            # Reward component: higher is better (log scale to not over-weight huge rewards)
-            import math
-            reward_score = math.log2(max(m.reward_pool, 1) + 1)
+            # Base: raw reward amount (this is what we're here for)
+            base = m.reward_pool
 
-            # Depth component: lower depth = less competition = more reward share
-            # Penalize heavily for thick books (>$10k depth)
+            # Depth bonus: low depth means less competition for rewards
+            # Gentle modifier — doesn't flip rankings
             depth = m.orderbook_depth_yes + m.orderbook_depth_no
-            if depth < 1000:
-                depth_score = 3.0  # thin book — great
-            elif depth < 5000:
-                depth_score = 2.0  # moderate
-            elif depth < 20000:
-                depth_score = 1.0  # thick but ok
+            if depth < 2000:
+                depth_mod = 1.3   # thin — we get a bigger reward share
+            elif depth < 10000:
+                depth_mod = 1.1   # moderate
+            elif depth < 50000:
+                depth_mod = 1.0   # average
             else:
-                depth_score = 0.3  # very thick — poor reward share
+                depth_mod = 0.8   # thick — our share is small
 
-            # Volume component: lower volume = less likely to get filled
+            # Volume penalty: high volume = more fills = more risk
+            # This is the main risk factor
             vol = m.volume_24h
-            if vol < 1000:
-                vol_score = 3.0  # quiet market — ideal
-            elif vol < 10000:
-                vol_score = 2.0  # moderate activity
-            elif vol < 100000:
-                vol_score = 1.0  # busy
+            if vol < 5000:
+                vol_mod = 1.2   # quiet — ideal, low fill risk
+            elif vol < 50000:
+                vol_mod = 1.0   # moderate
+            elif vol < 500000:
+                vol_mod = 0.8   # busy — decent fill risk
             else:
-                vol_score = 0.3  # very busy — high fill risk
+                vol_mod = 0.6   # very busy — high fill risk
 
-            m.our_share_estimate = reward_score * depth_score * vol_score
+            m.our_share_estimate = base * depth_mod * vol_mod
 
         eligible.sort(
             key=lambda m: (0 if m.is_fallback else 1, m.our_share_estimate),
@@ -747,9 +748,9 @@ class MarketScanner:
         for i, m in enumerate(eligible[:5]):
             depth = m.orderbook_depth_yes + m.orderbook_depth_no
             log.info(
-                f"  TOP {i+1}: score={m.our_share_estimate:.2f} | "
-                f"${m.reward_pool:.2f}/day | depth:${depth:.0f} | "
-                f"vol:{m.volume_24h:.0f} | {m.question[:45]}"
+                f"  TOP {i+1}: score={m.our_share_estimate:.1f} | "
+                f"${m.reward_pool:.2f}/day | depth:${depth:,.0f} | "
+                f"vol:${m.volume_24h:,.0f} | {m.question[:45]}"
             )
 
         log.info(

@@ -467,16 +467,14 @@ def run_simulation(config: BotConfig):
 
     for i, m in enumerate(selected):
         depth = m.orderbook_depth_yes + m.orderbook_depth_no
-        import math
-        r_score = math.log2(max(m.reward_pool, 1) + 1)
-        d_score = 3.0 if depth < 1000 else (2.0 if depth < 5000 else (1.0 if depth < 20000 else 0.3))
-        v_score = 3.0 if m.volume_24h < 1000 else (2.0 if m.volume_24h < 10000 else (1.0 if m.volume_24h < 100000 else 0.3))
-        raw_score = r_score * d_score * v_score
+        d_mod = 1.3 if depth < 2000 else (1.1 if depth < 10000 else (1.0 if depth < 50000 else 0.8))
+        v_mod = 1.2 if m.volume_24h < 5000 else (1.0 if m.volume_24h < 50000 else (0.8 if m.volume_24h < 500000 else 0.6))
+        raw_score = m.reward_pool * d_mod * v_mod
 
         log.info(f"  [{i+1}] {m.question}")
         log.info(f"      Reward: ${m.reward_pool:.2f}/day | Volume: ${m.volume_24h:,.0f}")
         log.info(f"      Depth: ${depth:,.0f} (YES: ${m.orderbook_depth_yes:.0f} | NO: ${m.orderbook_depth_no:.0f})")
-        log.info(f"      Score: {raw_score:.2f} = reward({r_score:.1f}) × depth({d_score:.1f}) × vol({v_score:.1f})")
+        log.info(f"      Score: {raw_score:.1f} = ${m.reward_pool:.0f} × depth({d_mod:.1f}) × vol({v_mod:.1f})")
         log.info(f"      Midpoint: {m.midpoint:.4f} | Spread: {m.spread:.4f}")
         log.info(f"      YES bid/ask: {m.yes_bid:.4f}/{m.yes_ask:.4f}")
         log.info(f"      NO  bid/ask: {m.no_bid:.4f}/{m.no_ask:.4f}")
