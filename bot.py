@@ -503,13 +503,13 @@ def run_simulation(config: BotConfig):
             if ok_yes and yes_meets_min:
                 risk.register_pending_order(m.condition_id, yes_cost)
                 total_simulated += yes_cost
-                sim_orders.append(("YES", yes_price, yes_shares, yes_cost, m.question[:40]))
+                sim_orders.append(("YES", yes_price, yes_shares, yes_cost, m.question[:40], m))
             elif not yes_meets_min:
                 log.info(f"    ^ YES skipped: {yes_shares:.0f} < {m.min_size:.0f} min shares")
             if ok_no and no_meets_min:
                 risk.register_pending_order(m.condition_id, no_cost)
                 total_simulated += no_cost
-                sim_orders.append(("NO", no_price, no_shares, no_cost, m.question[:40]))
+                sim_orders.append(("NO", no_price, no_shares, no_cost, m.question[:40], m))
             elif not no_meets_min:
                 log.info(f"    ^ NO skipped: {no_shares:.0f} < {m.min_size:.0f} min shares")
 
@@ -526,7 +526,7 @@ def run_simulation(config: BotConfig):
 
     if sim_orders:
         log.info("  Simulated orders:")
-        for side, price, shares, cost, q in sim_orders:
+        for side, price, shares, cost, q, _m in sim_orders:
             log.info(f"    {side:3s} BUY {shares:>8.2f} @ ${price:.4f} = ${cost:.2f}  |  {q}")
     else:
         log.info("  No orders would be placed (all blocked by risk manager)")
@@ -539,23 +539,23 @@ def run_simulation(config: BotConfig):
     else:
         log.info(f"\n  Under spending cap: ${total_simulated:.2f} / ${spending_cap:.2f}")
 
-    # Check if orders would score for rewards
+    # Check if orders would score for rewards (each order vs its OWN market)
     log.info("")
     log.info("  Reward eligibility check:")
-    for m in selected:
+    for side, price, shares, cost, q, m in sim_orders:
         yes_mid = m.midpoint
         no_mid = 1.0 - m.midpoint
-        for side, price, shares, cost, q in sim_orders:
-            # Use the correct midpoint for each side
-            mid = yes_mid if side == "YES" else no_mid
-            spread_from_mid = abs(price - mid)
-            within_max = spread_from_mid <= m.max_spread
-            meets_min = shares >= m.min_size
-            log.info(f"    {side} @ ${price:.4f}: spread_from_mid={spread_from_mid:.4f} "
-                     f"{'<=' if within_max else '>'} max_spread={m.max_spread:.4f} "
-                     f"{'OK' if within_max else 'NO REWARD'} | "
-                     f"size={shares:.0f} {'>=':s} min={m.min_size:.0f} "
-                     f"{'OK' if meets_min else 'TOO SMALL'}")
+        mid = yes_mid if side == "YES" else no_mid
+        spread_from_mid = abs(price - mid)
+        within_max = spread_from_mid <= m.max_spread
+        meets_min = shares >= m.min_size
+        scoring = within_max and meets_min
+        log.info(f"    {side} @ ${price:.4f} ({q}): "
+                 f"spread={spread_from_mid:.4f} {'<=' if within_max else '>'} max={m.max_spread:.4f} "
+                 f"{'OK' if within_max else 'FAIL'} | "
+                 f"size={shares:.0f} {'>=':s} min={m.min_size:.0f} "
+                 f"{'OK' if meets_min else 'FAIL'} | "
+                 f"{'SCORING' if scoring else 'NOT SCORING'}")
 
     log.info("")
     log.info("=" * 60)

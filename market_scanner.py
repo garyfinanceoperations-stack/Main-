@@ -481,7 +481,7 @@ class MarketScanner:
                 stats["no_tokens"] += 1
                 continue
             reward_amount = self._get_reward_amount(market)
-            if reward_amount <= 0:
+            if reward_amount < 0.50:
                 stats["no_reward"] += 1
                 continue
             # Skip markets where min shares requirement exceeds our budget
