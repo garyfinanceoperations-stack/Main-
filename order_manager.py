@@ -14,9 +14,10 @@ from logger import log
 class OrderManager:
     """Manages order lifecycle on Polymarket CLOB."""
 
-    def __init__(self, config: BotConfig, risk_manager: RiskManager):
+    def __init__(self, config: BotConfig, risk_manager: RiskManager, hard_cap: float = 0):
         self.config = config
         self.risk = risk_manager
+        self.hard_cap = hard_cap  # max total $ in open BUY orders (0 = no cap)
         self.client: ClobClient = None
         self.api_creds = None
         self.active_orders: dict[str, dict] = {}  # order_id -> order info
@@ -247,8 +248,25 @@ class OrderManager:
         side: BUY or SELL
         Returns order_id or None on failure.
         """
-        # Pre-trade risk check
         cost_usd = price * size
+
+        # HARD CAP: count total $ in ALL currently tracked BUY orders
+        # This prevents overexposure regardless of cancel/refresh cycles
+        if side == "BUY" and self.hard_cap > 0:
+            current_buy_total = sum(
+                info.get("cost_usd", 0)
+                for info in self.active_orders.values()
+                if info.get("side") == "BUY"
+            )
+            if current_buy_total + cost_usd > self.hard_cap:
+                log.warning(
+                    f"HARD CAP: ${current_buy_total:.2f} open + ${cost_usd:.2f} new "
+                    f"= ${current_buy_total + cost_usd:.2f} > ${self.hard_cap:.2f} cap. "
+                    f"Order blocked."
+                )
+                return None
+
+        # Pre-trade risk check
         ok, reason = self.risk.can_place_order(condition_id, side, cost_usd)
         if not ok:
             log.warning(f"Order blocked by risk manager: {reason}")

@@ -73,7 +73,7 @@ class PolymarketLPBot:
 
         # Initialize order manager (connects to CLOB API)
         try:
-            self.orders = OrderManager(self.config, self.risk)
+            self.orders = OrderManager(self.config, self.risk, hard_cap=self.spending_cap)
         except Exception as e:
             log.error(f"Failed to initialize order manager: {e}")
             return False
@@ -157,14 +157,8 @@ class PolymarketLPBot:
 
                 time.sleep(0.2)
 
-                # Check spending cap: only allow NEW markets if cap not reached
-                # Existing funded markets can always refresh
-                is_new = market.condition_id not in self.funded_markets
-                if is_new and self.cap_reached:
-                    log.info(f"  Skipping new market {market.condition_id[:16]} — spending cap reached")
-                    continue
-
                 # Place fresh two-sided quotes with learned adjustments
+                # Hard cap in place_limit_order blocks any BUY that would exceed $50 total
                 order_ids = self.orders.place_lp_quotes(
                     market, learned_params=learned
                 )
@@ -175,29 +169,12 @@ class PolymarketLPBot:
                         "order_ids": order_ids,
                         "last_refresh": time.time(),
                     }
-                    # Track spending for new markets only (refreshes don't add net exposure)
-                    if is_new:
-                        cost = sum(
-                            self.orders.active_orders[oid].get("cost_usd", 0)
-                            for oid in order_ids if oid in self.orders.active_orders
-                        )
-                        self._track_order_cost(cost)
-                        self.funded_markets.add(market.condition_id)
+                    self.funded_markets.add(market.condition_id)
 
             except Exception as e:
                 log.error(f"Error refreshing quotes for {market.condition_id[:16]}: {e}")
 
-    def _track_order_cost(self, cost_usd: float):
-        """Add to cumulative spending total. Called every time an order is placed."""
-        if self.spending_cap <= 0:
-            return
-        self.total_spent += cost_usd
-        if self.total_spent >= self.spending_cap and not self.cap_reached:
-            self.cap_reached = True
-            log.warning(
-                f"SPENDING CAP REACHED: ${self.total_spent:.2f} / ${self.spending_cap:.2f}. "
-                f"No NEW markets. Existing markets still refresh."
-            )
+    # Hard cap is enforced at the order level in OrderManager.place_limit_order
 
     def check_risk_and_act(self):
         """Run risk checks and execute any required actions."""
@@ -333,16 +310,14 @@ class PolymarketLPBot:
                                     fill["condition_id"],
                                 )
 
-                # === Scanning for NEW markets (only if cap not reached) ===
-                if not self.cap_reached and scan_counter % FULL_SCAN_EVERY == 0:
+                # === Full market scan periodically ===
+                if scan_counter % FULL_SCAN_EVERY == 0:
                     log.info("--- Full market scan ---")
                     markets = self.scan_and_select_markets()
                     if markets:
                         self.refresh_quotes(markets)
-                elif self.cap_reached and scan_counter % 5 == 0:
-                    log.info(f"Spending cap reached (${self.total_spent:.2f}/${self.spending_cap:.2f}) - no NEW markets, still refreshing existing")
 
-                # === ALWAYS refresh existing markets for max Q score ===
+                # === Refresh existing markets for max Q score ===
                 # Cancel+repost orders every cycle to track midpoint movement
                 if scan_counter % FULL_SCAN_EVERY != 0:  # skip on full-scan cycles (already refreshed)
                     existing = [
@@ -364,6 +339,23 @@ class PolymarketLPBot:
                             refreshed.append(m)
                             time.sleep(0.1)
                         self.refresh_quotes(refreshed)
+
+                # Log current exposure
+                if self.orders:
+                    buy_total = sum(
+                        info.get("cost_usd", 0)
+                        for info in self.orders.active_orders.values()
+                        if info.get("side") == "BUY"
+                    )
+                    sell_count = sum(
+                        1 for info in self.orders.active_orders.values()
+                        if info.get("side") == "SELL"
+                    )
+                    log.info(
+                        f"  Open orders: {len(self.orders.active_orders)} "
+                        f"(BUY ${buy_total:.2f} | {sell_count} SELLs) | "
+                        f"Cap: ${self.spending_cap:.2f}"
+                    )
 
                 # Always run risk checks
                 self.check_risk_and_act()
