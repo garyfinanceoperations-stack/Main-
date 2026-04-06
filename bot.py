@@ -467,14 +467,14 @@ def run_simulation(config: BotConfig):
 
     for i, m in enumerate(selected):
         depth = m.orderbook_depth_yes + m.orderbook_depth_no
-        d_mod = 1.3 if depth < 2000 else (1.1 if depth < 10000 else (1.0 if depth < 50000 else 0.8))
-        v_mod = 1.2 if m.volume_24h < 5000 else (1.0 if m.volume_24h < 50000 else (0.8 if m.volume_24h < 500000 else 0.6))
-        raw_score = m.reward_pool * d_mod * v_mod
+        # Back-calculate Q share from final score
+        q_share = m.our_share_estimate / max(m.reward_pool, 0.01)
 
         log.info(f"  [{i+1}] {m.question}")
-        log.info(f"      Reward: ${m.reward_pool:.2f}/day | Volume: ${m.volume_24h:,.0f}")
+        log.info(f"      Reward pool: ${m.reward_pool:.2f}/day | Expected: ${m.our_share_estimate:.2f}/day")
+        log.info(f"      Q score share: {q_share:.1%} of pool (based on real Polymarket formula)")
         log.info(f"      Depth: ${depth:,.0f} (YES: ${m.orderbook_depth_yes:.0f} | NO: ${m.orderbook_depth_no:.0f})")
-        log.info(f"      Score: {raw_score:.1f} = ${m.reward_pool:.0f} × depth({d_mod:.1f}) × vol({v_mod:.1f})")
+        log.info(f"      Volume: ${m.volume_24h:,.0f}/24h")
         log.info(f"      Midpoint: {m.midpoint:.4f} | Spread: {m.spread:.4f}")
         log.info(f"      YES bid/ask: {m.yes_bid:.4f}/{m.yes_ask:.4f}")
         log.info(f"      NO  bid/ask: {m.no_bid:.4f}/{m.no_ask:.4f}")

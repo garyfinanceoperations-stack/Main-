@@ -351,43 +351,106 @@ class MarketScanner:
                     return False  # too thick near midpoint
         return True
 
-    def _estimate_reward_share(self, market: dict, book_yes: dict, book_no: dict) -> float:
-        """Estimate what share of rewards we'd capture with our order sizes."""
-        # Calculate existing Q scores from the book
+    def _estimate_reward_share(self, market: dict, book_yes: dict, book_no: dict,
+                               midpoint: float = 0.5) -> float:
+        """
+        Estimate our share of rewards using Polymarket's ACTUAL formula.
+
+        Polymarket Q score (from docs):
+          S(v, spread) = ((v - spread) / v)^2   where v = max_spread
+          Q_one = sum(S * BidSize) for YES bids + sum(S * AskSize) for NO asks
+          Q_two = sum(S * AskSize) for YES asks + sum(S * BidSize) for NO bids
+          Q_min = max(min(Q_one, Q_two), max(Q_one/c, Q_two/c))  where c=3
+          Reward_share = our_Q_min / (our_Q_min + total_existing_Q_min)
+        """
         max_spread = self._get_max_spread(market)
-        midpoint = 0.5  # will be refined
+        no_mid = 1.0 - midpoint
 
-        # Get midpoint from book
-        yes_bids = book_yes.get("bids", [])
-        yes_asks = book_yes.get("asks", [])
-        if yes_bids and yes_asks:
-            best_bid = float(yes_bids[0]["price"])
-            best_ask = float(yes_asks[0]["price"])
-            midpoint = (best_bid + best_ask) / 2
+        def s_score(v: float, spread: float) -> float:
+            """Quadratic spread scoring: S(v, spread) = ((v - spread) / v)^2"""
+            if spread >= v or v <= 0:
+                return 0.0
+            return ((v - spread) / v) ** 2
 
-        # Calculate existing total Q score from all orders in the book
-        existing_q = 0.0
-        for side_orders in [yes_bids, yes_asks]:
-            for order in side_orders:
-                price = float(order["price"])
-                size = float(order["size"])
-                order_spread = abs(price - midpoint)
-                if order_spread <= max_spread:
-                    score = ((max_spread - order_spread) / max_spread) ** 2 * size
-                    existing_q += score
+        def order_spread_from_mid(price: float, mid: float) -> float:
+            return abs(price - mid)
 
-        # Estimate our Q score
-        our_q = 0.0
+        # === Calculate existing competitors' Q scores per-provider ===
+        # We can't know individual providers, so we estimate total Q_one/Q_two
+        # for the entire book, then compute what fraction our orders would add.
+
+        # Existing book contributions to Q_one and Q_two:
+        # Q_one uses: YES bids + NO asks
+        # Q_two uses: YES asks + NO bids
+        existing_q_one = 0.0
+        existing_q_two = 0.0
+
+        for order in book_yes.get("bids", []):
+            price = float(order["price"])
+            size = float(order["size"])
+            spread = order_spread_from_mid(price, midpoint)
+            existing_q_one += s_score(max_spread, spread) * size
+
+        for order in book_yes.get("asks", []):
+            price = float(order["price"])
+            size = float(order["size"])
+            spread = order_spread_from_mid(price, midpoint)
+            existing_q_two += s_score(max_spread, spread) * size
+
+        for order in book_no.get("bids", []):
+            price = float(order["price"])
+            size = float(order["size"])
+            spread = order_spread_from_mid(price, no_mid)
+            existing_q_two += s_score(max_spread, spread) * size
+
+        for order in book_no.get("asks", []):
+            price = float(order["price"])
+            size = float(order["size"])
+            spread = order_spread_from_mid(price, no_mid)
+            existing_q_one += s_score(max_spread, spread) * size
+
+        # Existing Q_min (assuming competitors are two-sided)
+        c = 3.0  # single-sided penalty divisor
+        existing_q_min = max(
+            min(existing_q_one, existing_q_two),
+            max(existing_q_one / c, existing_q_two / c),
+        )
+
+        # === Calculate OUR Q scores ===
+        # We place orders on both YES and NO sides near the midpoint
+        our_q_one = 0.0  # YES bids + NO asks
+        our_q_two = 0.0  # YES asks + NO bids
+
         for level in range(self.config.num_price_levels):
-            edge = self.config.min_edge + (self.config.max_edge - self.config.min_edge) * level / max(1, self.config.num_price_levels - 1)
-            if edge <= max_spread:
-                score = ((max_spread - edge) / max_spread) ** 2 * self.config.order_size
-                our_q += score * 2  # both sides
+            edge = self.config.min_edge + (
+                self.config.max_edge - self.config.min_edge
+            ) * level / max(1, self.config.num_price_levels - 1)
 
-        total_q = existing_q + our_q
-        if total_q == 0:
+            if edge >= max_spread:
+                continue
+
+            score = s_score(max_spread, edge)
+            # order_size is in USD; at ~midpoint price, shares ≈ order_size / midpoint
+            shares_yes = self.config.order_size / max(midpoint, 0.1)
+            shares_no = self.config.order_size / max(no_mid, 0.1)
+
+            # Our YES bid contributes to Q_one, YES ask to Q_two
+            our_q_one += score * shares_yes  # YES bid
+            our_q_two += score * shares_yes  # YES ask
+            # Our NO ask contributes to Q_one, NO bid to Q_two
+            our_q_one += score * shares_no   # NO ask
+            our_q_two += score * shares_no   # NO bid
+
+        # Our Q_min (we're two-sided, so min(Q_one, Q_two) applies)
+        our_q_min = max(
+            min(our_q_one, our_q_two),
+            max(our_q_one / c, our_q_two / c),
+        )
+
+        total_q_min = existing_q_min + our_q_min
+        if total_q_min == 0:
             return 1.0  # empty book, we'd get all rewards
-        return our_q / total_q
+        return our_q_min / total_q_min
 
     def _get_tokens(self, market: dict) -> list[str]:
         """Extract token IDs from a market dict, handling all API formats."""
@@ -640,11 +703,11 @@ class MarketScanner:
                 # Spread must be <= 6c (or empty/center-empty books where we set our own spread)
                 spread_ok = center_is_empty or spread <= 0.06
 
-                # === RULE 5: Reward share estimate ===
+                # === RULE 5: Reward share estimate (using real Polymarket Q score) ===
                 if center_is_empty:
                     share = 1.0  # we'd be the only LP near the center
                 else:
-                    share = self._estimate_reward_share(market, book_yes, book_no)
+                    share = self._estimate_reward_share(market, book_yes, book_no, mid)
 
                 volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
 
@@ -706,51 +769,43 @@ class MarketScanner:
                 log.debug(f"Error processing market: {e}")
                 continue
 
-        # Score markets: reward is king, depth and volume are modifiers
-        # High reward = more $ earned. Low depth = bigger share. Low volume = fewer fills.
-        # But a $14/day market always beats a $6/day market unless depth/vol are extreme.
+        # Score markets using Polymarket's ACTUAL reward formula:
+        # Expected daily reward = reward_pool × our_Q_min_share
+        # our_share_estimate already contains Q-score-based share from _estimate_reward_share()
+        # Final score = expected_daily_USD with a small volume risk discount
         for m in eligible:
-            # Base: raw reward amount (this is what we're here for)
-            base = m.reward_pool
+            # Expected daily reward based on real Q score share
+            expected_daily = m.reward_pool * m.our_share_estimate
 
-            # Depth bonus: low depth means less competition for rewards
-            # Gentle modifier — doesn't flip rankings
-            depth = m.orderbook_depth_yes + m.orderbook_depth_no
-            if depth < 2000:
-                depth_mod = 1.3   # thin — we get a bigger reward share
-            elif depth < 10000:
-                depth_mod = 1.1   # moderate
-            elif depth < 50000:
-                depth_mod = 1.0   # average
-            else:
-                depth_mod = 0.8   # thick — our share is small
-
-            # Volume penalty: high volume = more fills = more risk
-            # This is the main risk factor
+            # Light volume discount: high volume means more fills = more risk of loss
+            # This is NOT part of Polymarket's formula, but protects our capital
             vol = m.volume_24h
             if vol < 5000:
-                vol_mod = 1.2   # quiet — ideal, low fill risk
+                vol_risk = 1.0    # quiet — minimal fill risk
             elif vol < 50000:
-                vol_mod = 1.0   # moderate
+                vol_risk = 0.95   # moderate
             elif vol < 500000:
-                vol_mod = 0.8   # busy — decent fill risk
+                vol_risk = 0.85   # busy — some fill risk
             else:
-                vol_mod = 0.6   # very busy — high fill risk
+                vol_risk = 0.70   # very busy — high fill risk
 
-            m.our_share_estimate = base * depth_mod * vol_mod
+            m.our_share_estimate = expected_daily * vol_risk
 
         eligible.sort(
             key=lambda m: (0 if m.is_fallback else 1, m.our_share_estimate),
             reverse=True,
         )
 
-        # Log top 5 with scores for transparency
+        # Log top 5 with Q-score breakdown for transparency
         for i, m in enumerate(eligible[:5]):
             depth = m.orderbook_depth_yes + m.orderbook_depth_no
+            # Back-calculate Q share from final score
+            q_share = m.our_share_estimate / max(m.reward_pool, 0.01)
             log.info(
-                f"  TOP {i+1}: score={m.our_share_estimate:.1f} | "
-                f"${m.reward_pool:.2f}/day | depth:${depth:,.0f} | "
-                f"vol:${m.volume_24h:,.0f} | {m.question[:45]}"
+                f"  TOP {i+1}: ${m.our_share_estimate:.2f}/day expected | "
+                f"pool:${m.reward_pool:.2f} × Q_share:{q_share:.1%} | "
+                f"depth:${depth:,.0f} | vol:${m.volume_24h:,.0f} | "
+                f"{m.question[:45]}"
             )
 
         log.info(
