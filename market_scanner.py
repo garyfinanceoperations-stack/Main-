@@ -364,6 +364,7 @@ class MarketScanner:
           Reward_share = our_Q_min / (our_Q_min + total_existing_Q_min)
         """
         max_spread = self._get_max_spread(market)
+        min_size = self._get_min_size(market)
         no_mid = 1.0 - midpoint
 
         def s_score(v: float, spread: float) -> float:
@@ -378,6 +379,7 @@ class MarketScanner:
         # === Calculate existing competitors' Q scores per-provider ===
         # We can't know individual providers, so we estimate total Q_one/Q_two
         # for the entire book, then compute what fraction our orders would add.
+        # NOTE: Orders below min_size earn ZERO and are excluded (per Polymarket docs).
 
         # Existing book contributions to Q_one and Q_two:
         # Q_one uses: YES bids + NO asks
@@ -388,24 +390,32 @@ class MarketScanner:
         for order in book_yes.get("bids", []):
             price = float(order["price"])
             size = float(order["size"])
+            if size < min_size:
+                continue  # below min_size = no reward + excluded from midpoint
             spread = order_spread_from_mid(price, midpoint)
             existing_q_one += s_score(max_spread, spread) * size
 
         for order in book_yes.get("asks", []):
             price = float(order["price"])
             size = float(order["size"])
+            if size < min_size:
+                continue
             spread = order_spread_from_mid(price, midpoint)
             existing_q_two += s_score(max_spread, spread) * size
 
         for order in book_no.get("bids", []):
             price = float(order["price"])
             size = float(order["size"])
+            if size < min_size:
+                continue
             spread = order_spread_from_mid(price, no_mid)
             existing_q_two += s_score(max_spread, spread) * size
 
         for order in book_no.get("asks", []):
             price = float(order["price"])
             size = float(order["size"])
+            if size < min_size:
+                continue
             spread = order_spread_from_mid(price, no_mid)
             existing_q_one += s_score(max_spread, spread) * size
 
