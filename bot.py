@@ -282,7 +282,7 @@ class PolymarketLPBot:
 
         self.running = True
         scan_counter = 0
-        FULL_SCAN_EVERY = 10  # full market re-scan every 10 cycles
+        FULL_SCAN_EVERY = 3  # full market re-scan every 3 cycles to stay on best markets
 
         if self.spending_cap > 0:
             log.info(f"LIVE TEST MODE: max ${self.spending_cap:.2f} in orders, then monitor only")
@@ -300,11 +300,16 @@ class PolymarketLPBot:
                     fills = self.orders.detect_fills()
                     if fills:
                         for fill in fills:
-                            # Place SELL orders for filled positions
+                            # Place SELL order: midpoint + edge, floor at buy - 5c
                             sell_price = round(fill["price"] + self.config.min_edge, 4)
+                            min_sell = round(fill["price"] - 0.05, 4)
+                            sell_price = max(sell_price, min_sell)
                             sell_price = max(0.02, min(0.99, sell_price))
                             if fill["size"] > 0:
-                                log.info(f"  Placing SELL to exit: {fill['side']} {fill['size']:.2f} @ ${sell_price:.4f}")
+                                log.info(
+                                    f"  Placing SELL to exit: {fill['side']} {fill['size']:.2f} "
+                                    f"@ ${sell_price:.4f} (bought @ ${fill['price']:.4f})"
+                                )
                                 self.orders.place_limit_order(
                                     fill["token_id"], "SELL", sell_price, fill["size"],
                                     fill["condition_id"],

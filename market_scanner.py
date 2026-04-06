@@ -706,11 +706,51 @@ class MarketScanner:
                 log.debug(f"Error processing market: {e}")
                 continue
 
-        # Sort: primary targets first (by share * reward), then fallbacks
+        # Score markets: best = high rewards, low depth, low volume
+        # This finds markets where we earn the most rewards with least fill risk
+        for m in eligible:
+            # Reward component: higher is better (log scale to not over-weight huge rewards)
+            import math
+            reward_score = math.log2(max(m.reward_pool, 1) + 1)
+
+            # Depth component: lower depth = less competition = more reward share
+            # Penalize heavily for thick books (>$10k depth)
+            depth = m.orderbook_depth_yes + m.orderbook_depth_no
+            if depth < 1000:
+                depth_score = 3.0  # thin book — great
+            elif depth < 5000:
+                depth_score = 2.0  # moderate
+            elif depth < 20000:
+                depth_score = 1.0  # thick but ok
+            else:
+                depth_score = 0.3  # very thick — poor reward share
+
+            # Volume component: lower volume = less likely to get filled
+            vol = m.volume_24h
+            if vol < 1000:
+                vol_score = 3.0  # quiet market — ideal
+            elif vol < 10000:
+                vol_score = 2.0  # moderate activity
+            elif vol < 100000:
+                vol_score = 1.0  # busy
+            else:
+                vol_score = 0.3  # very busy — high fill risk
+
+            m.our_share_estimate = reward_score * depth_score * vol_score
+
         eligible.sort(
-            key=lambda m: (0 if m.is_fallback else 1, m.our_share_estimate * m.reward_pool),
+            key=lambda m: (0 if m.is_fallback else 1, m.our_share_estimate),
             reverse=True,
         )
+
+        # Log top 5 with scores for transparency
+        for i, m in enumerate(eligible[:5]):
+            depth = m.orderbook_depth_yes + m.orderbook_depth_no
+            log.info(
+                f"  TOP {i+1}: score={m.our_share_estimate:.2f} | "
+                f"${m.reward_pool:.2f}/day | depth:${depth:.0f} | "
+                f"vol:{m.volume_24h:.0f} | {m.question[:45]}"
+            )
 
         log.info(
             f"Scan: {len(eligible)} eligible ({stats['fallback']} fallback) | "

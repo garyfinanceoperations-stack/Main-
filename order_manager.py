@@ -367,12 +367,22 @@ class OrderManager:
         has_no_position = exposure and exposure.no_position and exposure.no_position.size > 0
 
         # === SELL orders first for any existing positions (exit + score rewards) ===
+        # Moving sell: tracks midpoint + edge, but never lower than:
+        #   1. buy_price - 0.05 (max 5c loss)
+        #   2. best bid on the book (don't sell below the market)
         if has_yes_position:
             mid = midpoint
             sell_price = round(mid + min_edge, 4)
+            # Floor 1: max 5c below our buy price
+            buy_price = exposure.yes_position.avg_price if hasattr(exposure.yes_position, 'avg_price') else exposure.yes_position.cost_basis / max(exposure.yes_position.size, 1)
+            min_sell = round(buy_price - 0.05, 4)
+            # Floor 2: best bid on book (don't go below the market)
+            if market.yes_bid > 0:
+                min_sell = max(min_sell, market.yes_bid)
+            sell_price = max(sell_price, min_sell)
             sell_price = max(0.02, min(0.99, sell_price))
             log.info(f"  YES SELL: {exposure.yes_position.size:.0f} shares @ ${sell_price:.4f} "
-                     f"(exit position)")
+                     f"(bought ~${buy_price:.4f}, floor ${min_sell:.4f})")
             oid = self.place_limit_order(
                 market.token_yes, "SELL", sell_price, exposure.yes_position.size,
                 market.condition_id,
@@ -384,9 +394,16 @@ class OrderManager:
         if has_no_position:
             no_mid = 1 - midpoint
             sell_price = round(no_mid + min_edge, 4)
+            # Floor 1: max 5c below our buy price
+            buy_price = exposure.no_position.avg_price if hasattr(exposure.no_position, 'avg_price') else exposure.no_position.cost_basis / max(exposure.no_position.size, 1)
+            min_sell = round(buy_price - 0.05, 4)
+            # Floor 2: best bid on book
+            if market.no_bid > 0:
+                min_sell = max(min_sell, market.no_bid)
+            sell_price = max(sell_price, min_sell)
             sell_price = max(0.02, min(0.99, sell_price))
             log.info(f"  NO  SELL: {exposure.no_position.size:.0f} shares @ ${sell_price:.4f} "
-                     f"(exit position)")
+                     f"(bought ~${buy_price:.4f}, floor ${min_sell:.4f})")
             oid = self.place_limit_order(
                 market.token_no, "SELL", sell_price, exposure.no_position.size,
                 market.condition_id,
