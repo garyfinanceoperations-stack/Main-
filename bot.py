@@ -444,6 +444,14 @@ def run_simulation(config: BotConfig):
 
     # Filter through learner
     markets = [m for m in markets if not learner.is_blacklisted(m.condition_id)]
+
+    # Affordability filter: skip markets where min_size exceeds our per-side budget
+    max_per_side = config.max_exposure_per_market / 2
+    before = len(markets)
+    markets = [m for m in markets if m.min_size * 0.50 <= max_per_side]
+    if len(markets) < before:
+        log.info(f"  Skipped {before - len(markets)} markets: can't afford min_size within ${max_per_side:.0f}/side")
+
     for m in markets:
         m.our_share_estimate = learner.score_market(
             m.condition_id, m.reward_pool, m.our_share_estimate,
@@ -458,15 +466,22 @@ def run_simulation(config: BotConfig):
     log.info("=" * 60)
 
     for i, m in enumerate(selected):
+        depth = m.orderbook_depth_yes + m.orderbook_depth_no
+        import math
+        r_score = math.log2(max(m.reward_pool, 1) + 1)
+        d_score = 3.0 if depth < 1000 else (2.0 if depth < 5000 else (1.0 if depth < 20000 else 0.3))
+        v_score = 3.0 if m.volume_24h < 1000 else (2.0 if m.volume_24h < 10000 else (1.0 if m.volume_24h < 100000 else 0.3))
+        raw_score = r_score * d_score * v_score
+
         log.info(f"  [{i+1}] {m.question}")
-        log.info(f"      Condition: {m.condition_id[:24]}...")
-        log.info(f"      Reward: ${m.reward_pool:.2f}/day | Score: {m.our_share_estimate:.2%}")  # .2f shows sub-$1 rates
+        log.info(f"      Reward: ${m.reward_pool:.2f}/day | Volume: ${m.volume_24h:,.0f}")
+        log.info(f"      Depth: ${depth:,.0f} (YES: ${m.orderbook_depth_yes:.0f} | NO: ${m.orderbook_depth_no:.0f})")
+        log.info(f"      Score: {raw_score:.2f} = reward({r_score:.1f}) × depth({d_score:.1f}) × vol({v_score:.1f})")
         log.info(f"      Midpoint: {m.midpoint:.4f} | Spread: {m.spread:.4f}")
         log.info(f"      YES bid/ask: {m.yes_bid:.4f}/{m.yes_ask:.4f}")
         log.info(f"      NO  bid/ask: {m.no_bid:.4f}/{m.no_ask:.4f}")
-        log.info(f"      Depth YES: ${m.orderbook_depth_yes:.0f} | NO: ${m.orderbook_depth_no:.0f}")
-        log.info(f"      Max spread for rewards: {m.max_spread:.4f} | Min size: {m.min_size:.0f}")
-        log.info(f"      Fallback market: {'YES' if m.is_fallback else 'NO'}")
+        log.info(f"      Reward rules: max_spread={m.max_spread:.4f} | min_size={m.min_size:.0f} shares")
+        log.info(f"      Min cost/side: {m.min_size:.0f} × $0.49 = ${m.min_size * 0.49:.2f}")
         log.info("")
 
     # === STEP 3: Simulate order placement ===
@@ -476,6 +491,7 @@ def run_simulation(config: BotConfig):
 
     total_simulated = 0.0
     sim_orders = []
+    hard_cap = 50.0  # same as live-test
     learned = learner.get_adjusted_params() or {}
     min_edge = learned.get("min_edge", config.min_edge)
     max_edge = learned.get("max_edge", config.max_edge)
@@ -546,15 +562,21 @@ def run_simulation(config: BotConfig):
                      f"{'OK' if ok_no else f'BLOCKED: {reason_no}'}")
 
             if ok_yes and yes_meets_min:
-                risk.register_pending_order(m.condition_id, yes_cost)
-                total_simulated += yes_cost
-                sim_orders.append(("YES", yes_price, yes_shares, yes_cost, m.question[:40], m))
+                if total_simulated + yes_cost > hard_cap:
+                    log.info(f"    ^ YES HARD CAP: ${total_simulated:.2f} + ${yes_cost:.2f} > ${hard_cap:.2f}")
+                else:
+                    risk.register_pending_order(m.condition_id, yes_cost)
+                    total_simulated += yes_cost
+                    sim_orders.append(("YES", yes_price, yes_shares, yes_cost, m.question[:40], m))
             elif not yes_meets_min:
                 log.info(f"    ^ YES skipped: {yes_shares:.0f} < {m.min_size:.0f} min shares")
             if ok_no and no_meets_min:
-                risk.register_pending_order(m.condition_id, no_cost)
-                total_simulated += no_cost
-                sim_orders.append(("NO", no_price, no_shares, no_cost, m.question[:40], m))
+                if total_simulated + no_cost > hard_cap:
+                    log.info(f"    ^ NO  HARD CAP: ${total_simulated:.2f} + ${no_cost:.2f} > ${hard_cap:.2f}")
+                else:
+                    risk.register_pending_order(m.condition_id, no_cost)
+                    total_simulated += no_cost
+                    sim_orders.append(("NO", no_price, no_shares, no_cost, m.question[:40], m))
             elif not no_meets_min:
                 log.info(f"    ^ NO skipped: {no_shares:.0f} < {m.min_size:.0f} min shares")
 
