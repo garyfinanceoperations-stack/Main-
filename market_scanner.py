@@ -701,21 +701,19 @@ class MarketScanner:
                     continue
 
                 # Per-side exit liquidity: can we sell back after a fill?
-                # Check if there are bids within 15c of where we'd place orders
-                # If no bids exist, our BUY would fill and we'd be stuck.
+                # Need bids within 15c of midpoint — bids at $0.20 when mid is $0.50
+                # are NOT exit liquidity (that's a 60% loss).
                 no_bids = book_no.get("bids", [])
 
+                yes_exit_threshold = mid - 0.15  # e.g., 0.35 for mid=0.50
+                no_exit_threshold = no_mid - 0.15
+
                 yes_has_exit = any(
-                    float(b["price"]) >= 0.15 for b in yes_bids
+                    float(b["price"]) >= yes_exit_threshold for b in yes_bids
                 ) if yes_bids else False
                 no_has_exit = any(
-                    float(b["price"]) >= 0.15 for b in no_bids
+                    float(b["price"]) >= no_exit_threshold for b in no_bids
                 ) if no_bids else False
-
-                # Need at least ONE side with exit liquidity
-                if not yes_has_exit and not no_has_exit:
-                    stats["empty_book"] += 1
-                    continue
 
                 # Spread check: tight books are ideal, center-empty still allowed
                 spread_ok = center_is_empty or spread <= 0.10
