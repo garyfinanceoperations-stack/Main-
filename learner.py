@@ -344,9 +344,12 @@ class Learner:
         2. Historical performance bonus/penalty
         3. Similarity to historically profitable markets
 
-        Returns a float score (higher = better). Base score is reward * share.
+        Returns a float score (higher = better).
+        our_share is already expected daily USD from the Q-score formula.
         """
-        base_score = reward_pool * our_share
+        # our_share is already expected_daily_USD (reward_pool × Q_share × vol_risk)
+        # from the scanner — do NOT multiply by reward_pool again
+        base_score = our_share
 
         rec = self.markets.get(condition_id)
         if not rec or rec.sessions_active < self.MIN_SESSIONS_FOR_SCORING:
