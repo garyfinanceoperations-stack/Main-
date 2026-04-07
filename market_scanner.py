@@ -33,6 +33,8 @@ class MarketInfo:
     active: bool = True
     outcomes: list = field(default_factory=lambda: ["Yes", "No"])
     is_fallback: bool = False  # True = high volume market outside normal range
+    yes_has_exit: bool = True  # True = there are bids to sell YES into
+    no_has_exit: bool = True   # True = there are bids to sell NO into
 
 
 class MarketScanner:
@@ -653,13 +655,8 @@ class MarketScanner:
                     spread = 0.0
                     center_is_empty = True
 
-                # SKIP center-empty markets entirely.
-                # If we're the only order near the midpoint, sellers snipe us instantly
-                # and there are no bids to sell back to. We need existing liquidity
-                # near center to hide among. Spread <= 10c means real two-sided book.
-                if center_is_empty:
-                    stats["empty_center"] += 1
-                    continue
+                # Center-empty markets are allowed but flagged.
+                # Order manager will check per-side exit liquidity before placing.
 
                 if mid < 0.15 or mid > 0.85:
                     stats["bad_midpoint"] += 1
@@ -696,19 +693,46 @@ class MarketScanner:
                         no_best_ask = p
                         break
 
-                # SKIP truly empty books — no orders at all means our BUY orders
-                # become the only liquidity and fill instantly against any seller.
-                # We need existing orders on the book to hide among.
+                # SKIP truly empty books — no orders at all
                 book_is_empty = (len(yes_bids) == 0 and len(yes_asks) == 0)
                 if book_is_empty:
                     stats["empty_book"] += 1
                     continue
 
-                # Spread must be <= 10c — we only want markets with real two-sided book
-                spread_ok = spread <= 0.10
+                # Per-side exit liquidity: can we sell back after a fill?
+                # Check if there are bids within 15c of where we'd place orders
+                # If no bids exist, our BUY would fill and we'd be stuck.
+                no_bids = book_no.get("bids", [])
+
+                yes_has_exit = any(
+                    float(b["price"]) >= 0.15 for b in yes_bids
+                ) if yes_bids else False
+                no_has_exit = any(
+                    float(b["price"]) >= 0.15 for b in no_bids
+                ) if no_bids else False
+
+                # Need at least ONE side with exit liquidity
+                if not yes_has_exit and not no_has_exit:
+                    stats["empty_book"] += 1
+                    continue
+
+                # Spread check: tight books are ideal, center-empty still allowed
+                spread_ok = center_is_empty or spread <= 0.10
 
                 # === RULE 5: Reward share estimate (using real Polymarket Q score) ===
-                share = self._estimate_reward_share(market, book_yes, book_no, mid)
+                if center_is_empty:
+                    # Center-empty: estimate share based on book depth (proxy for competition)
+                    total_depth = depth_yes_usd + depth_no_usd
+                    if total_depth < 500:
+                        share = 1.0
+                    elif total_depth < 5000:
+                        share = 0.70
+                    elif total_depth < 50000:
+                        share = 0.35
+                    else:
+                        share = 0.15
+                else:
+                    share = self._estimate_reward_share(market, book_yes, book_no, mid)
 
                 volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
 
@@ -760,6 +784,8 @@ class MarketScanner:
                     our_share_estimate=share,
                     neg_risk=bool(market.get("negRisk", market.get("neg_risk", False))),
                     is_fallback=is_fallback,
+                    yes_has_exit=yes_has_exit,
+                    no_has_exit=no_has_exit,
                 )
                 eligible.append(info)
 

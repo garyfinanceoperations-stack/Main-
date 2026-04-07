@@ -430,8 +430,8 @@ class OrderManager:
 
             max_per_side = self.config.max_exposure_per_market / 2
 
-            # === YES BUY (only if no existing YES position) ===
-            if not has_yes_position:
+            # === YES BUY (only if no existing YES position AND exit liquidity exists) ===
+            if not has_yes_position and getattr(market, 'yes_has_exit', True):
                 if use_undercut and market.yes_bid > 0:
                     if abs(market.yes_bid - midpoint) <= 0.15:
                         yes_bid_price = round(market.yes_bid + 0.01, 4)
@@ -459,11 +459,13 @@ class OrderManager:
                     if oid:
                         order_ids.append(oid)
                     time.sleep(0.1)
+            elif not getattr(market, 'yes_has_exit', True):
+                log.warning(f"  YES BUY SKIPPED: no exit liquidity (no YES bids on book)")
             else:
                 log.info(f"  YES: holding {exposure.yes_position.size:.0f} shares — BUY skipped, SELL placed")
 
-            # === NO BUY (only if no existing NO position) ===
-            if not has_no_position:
+            # === NO BUY (only if no existing NO position AND exit liquidity exists) ===
+            if not has_no_position and getattr(market, 'no_has_exit', True):
                 no_mid = 1 - midpoint
                 if use_undercut and market.no_bid > 0:
                     if abs(market.no_bid - no_mid) <= 0.15:
@@ -498,6 +500,8 @@ class OrderManager:
                     if oid:
                         order_ids.append(oid)
                     time.sleep(0.1)
+            elif not getattr(market, 'no_has_exit', True):
+                log.warning(f"  NO  BUY SKIPPED: no exit liquidity (no NO bids on book)")
             else:
                 log.info(f"  NO: holding {exposure.no_position.size:.0f} shares — BUY skipped, SELL placed")
 

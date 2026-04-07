@@ -225,48 +225,59 @@ class PolymarketLPBot:
         for action in actions:
             try:
                 if action["action"] == "reduce":
-                    # Partial sell to cap losses at ~$10
+                    # Partial sell to cap losses
                     log.warning(f"RISK REDUCTION: {action['reason']}")
                     # Cancel orders first
                     self.orders.cancel_market_orders(action["condition_id"])
                     time.sleep(0.3)
                     # Market sell the position
-                    self.orders.market_sell(
+                    result = self.orders.market_sell(
                         action["token_id"],
                         action["size"],
                         action["condition_id"],
                         partial=True,
                     )
-                    # Record the close
-                    self.risk.record_close(
-                        action["condition_id"],
-                        action["side"],
-                        0,  # actual proceeds will be updated on fill
-                    )
-                    # Feed loss to learner
-                    self.learner.record_trade_result(
-                        action["condition_id"], -action["loss"]
-                    )
+                    if result:
+                        # Only record close if sell actually executed
+                        self.risk.record_close(
+                            action["condition_id"],
+                            action["side"],
+                            0,  # actual proceeds will be updated on fill
+                        )
+                        self.learner.record_trade_result(
+                            action["condition_id"], -action["loss"]
+                        )
+                    else:
+                        # No liquidity to sell — hold position and SELL order
+                        log.warning(
+                            f"  Can't force-sell {action['side']} in {action['condition_id'][:16]} "
+                            f"— no bids. Holding SELL order, will exit when bids appear."
+                        )
 
                 elif action["action"] == "emergency_exit":
                     # Full dump
                     log.critical(f"EMERGENCY EXIT: {action['reason']}")
                     self.orders.cancel_market_orders(action["condition_id"])
                     time.sleep(0.3)
-                    self.orders.emergency_dump(
+                    result = self.orders.emergency_dump(
                         action["token_id"],
                         action["size"],
                         action["condition_id"],
                     )
-                    self.risk.record_close(
-                        action["condition_id"],
-                        action["side"],
-                        0,
-                    )
-                    # Feed loss to learner
-                    self.learner.record_trade_result(
-                        action["condition_id"], -action["loss"]
-                    )
+                    if result:
+                        self.risk.record_close(
+                            action["condition_id"],
+                            action["side"],
+                            0,
+                        )
+                        self.learner.record_trade_result(
+                            action["condition_id"], -action["loss"]
+                        )
+                    else:
+                        log.warning(
+                            f"  Can't emergency-sell {action['side']} — no bids. "
+                            f"Holding position, will retry next cycle."
+                        )
                     # Remove from active markets
                     self.active_markets.pop(action["condition_id"], None)
 
