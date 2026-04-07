@@ -715,7 +715,18 @@ class MarketScanner:
 
                 # === RULE 5: Reward share estimate (using real Polymarket Q score) ===
                 if center_is_empty:
-                    share = 1.0  # we'd be the only LP near the center
+                    # Center is empty NOW, but existing book depth signals active LPs
+                    # who will likely move to compete for center rewards.
+                    # More depth = more competition risk = lower expected share.
+                    total_depth = depth_yes_usd + depth_no_usd
+                    if total_depth < 500:
+                        share = 1.0   # truly deserted — we'd own the rewards
+                    elif total_depth < 5000:
+                        share = 0.70  # light LP presence, some will compete
+                    elif total_depth < 50000:
+                        share = 0.35  # active LPs, many will move to center
+                    else:
+                        share = 0.15  # deep book, serious MM competition incoming
                 else:
                     share = self._estimate_reward_share(market, book_yes, book_no, mid)
 
