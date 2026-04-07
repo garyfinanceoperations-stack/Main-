@@ -32,9 +32,10 @@ class MarketInfo:
     neg_risk: bool = False
     active: bool = True
     outcomes: list = field(default_factory=lambda: ["Yes", "No"])
-    is_fallback: bool = False  # True = high volume market outside normal range
-    yes_has_exit: bool = True  # True = there are bids to sell YES into
-    no_has_exit: bool = True   # True = there are bids to sell NO into
+    is_fallback: bool = False   # True = high volume market outside normal range
+    yes_has_exit: bool = True   # True = there are bids to sell YES into
+    no_has_exit: bool = True    # True = there are bids to sell NO into
+    center_is_empty: bool = False  # True = no orders near midpoint (spread > 20c)
 
 
 class MarketScanner:
@@ -786,6 +787,7 @@ class MarketScanner:
                     is_fallback=is_fallback,
                     yes_has_exit=yes_has_exit,
                     no_has_exit=no_has_exit,
+                    center_is_empty=center_is_empty,
                 )
                 eligible.append(info)
 
@@ -811,17 +813,21 @@ class MarketScanner:
             else:
                 vol_risk = 0.70
 
-            # Spread safety: tight spreads mean real two-sided book,
-            # we can hide among existing orders and exit safely.
-            # Center-empty books (spread > 20c) = we're a sitting duck.
-            if m.spread <= 0.06:
-                spread_safety = 2.0   # tight book — safest, boost reward score
-            elif m.spread <= 0.10:
-                spread_safety = 1.5   # reasonable book
-            elif m.spread <= 0.20:
-                spread_safety = 1.0   # wide but not empty
+            # Spread safety: REAL two-sided book = safe, one-sided/empty = death trap.
+            # m.spread can be synthetic (0.04) when only one side has orders.
+            # Check if both bid AND ask exist on at least the YES side to confirm
+            # a real two-sided book. bid=0 or ask=0 means synthetic spread.
+            has_real_two_sided = (m.yes_bid > 0 and m.yes_ask > 0)
+            real_spread = m.spread if has_real_two_sided else 1.0  # treat one-sided as wide
+
+            if has_real_two_sided and real_spread <= 0.06:
+                spread_safety = 2.0   # tight REAL book — safest
+            elif has_real_two_sided and real_spread <= 0.10:
+                spread_safety = 1.5   # reasonable real book
+            elif has_real_two_sided and real_spread <= 0.20:
+                spread_safety = 1.0   # wide but real two-sided
             else:
-                spread_safety = 0.3   # center-empty — high fill risk, heavy penalty
+                spread_safety = 0.3   # one-sided or center-empty — fill risk
 
             # Exit liquidity: can we sell on both sides?
             if m.yes_has_exit and m.no_has_exit:

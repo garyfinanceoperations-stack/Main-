@@ -487,9 +487,12 @@ def run_simulation(config: BotConfig):
         log.info(f"      Depth: ${depth:,.0f} (YES: ${m.orderbook_depth_yes:.0f} | NO: ${m.orderbook_depth_no:.0f})")
         log.info(f"      Volume: ${m.volume_24h:,.0f}/24h")
         log.info(f"      Midpoint: {m.midpoint:.4f} | Spread: {m.spread:.4f}")
-        log.info(f"      YES bid/ask: {m.yes_bid:.4f}/{m.yes_ask:.4f}")
-        log.info(f"      NO  bid/ask: {m.no_bid:.4f}/{m.no_ask:.4f}")
-        log.info(f"      Reward rules: max_spread={m.max_spread:.4f} | min_size={m.min_size:.0f} shares")
+        yes_exit = "EXIT OK" if getattr(m, 'yes_has_exit', True) else "NO EXIT"
+        no_exit = "EXIT OK" if getattr(m, 'no_has_exit', True) else "NO EXIT"
+        book_type = "CENTER EMPTY" if getattr(m, 'center_is_empty', False) else "TWO-SIDED"
+        log.info(f"      YES bid/ask: {m.yes_bid:.4f}/{m.yes_ask:.4f} [{yes_exit}]")
+        log.info(f"      NO  bid/ask: {m.no_bid:.4f}/{m.no_ask:.4f} [{no_exit}]")
+        log.info(f"      Book: {book_type} | Reward rules: max_spread={m.max_spread:.4f} | min_size={m.min_size:.0f} shares")
         log.info(f"      Min cost/side: {m.min_size:.0f} × $0.49 = ${m.min_size * 0.49:.2f}")
         log.info("")
 
