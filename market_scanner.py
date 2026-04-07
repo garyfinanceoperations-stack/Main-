@@ -795,30 +795,46 @@ class MarketScanner:
 
         # Score markets using Polymarket's ACTUAL reward formula:
         # Expected daily reward = reward_pool × our_Q_min_share
-        # our_share_estimate already contains Q-score-based share from _estimate_reward_share()
-        # Final score = expected_daily_USD with a small volume risk discount
+        # Adjusted for: volume risk, spread safety, exit liquidity
         for m in eligible:
             # Expected daily reward based on real Q score share
             expected_daily = m.reward_pool * m.our_share_estimate
 
-            # Light volume discount: high volume means more fills = more risk of loss
-            # This is NOT part of Polymarket's formula, but protects our capital
+            # Volume risk: high volume = more fills = more loss risk
             vol = m.volume_24h
             if vol < 5000:
-                vol_risk = 1.0    # quiet — minimal fill risk
+                vol_risk = 1.0
             elif vol < 50000:
-                vol_risk = 0.95   # moderate
+                vol_risk = 0.95
             elif vol < 500000:
-                vol_risk = 0.85   # busy — some fill risk
+                vol_risk = 0.85
             else:
-                vol_risk = 0.70   # very busy — high fill risk
+                vol_risk = 0.70
 
-            m.our_share_estimate = expected_daily * vol_risk
+            # Spread safety: tight spreads mean real two-sided book,
+            # we can hide among existing orders and exit safely.
+            # Center-empty books (spread > 20c) = we're a sitting duck.
+            if m.spread <= 0.06:
+                spread_safety = 2.0   # tight book — safest, boost reward score
+            elif m.spread <= 0.10:
+                spread_safety = 1.5   # reasonable book
+            elif m.spread <= 0.20:
+                spread_safety = 1.0   # wide but not empty
+            else:
+                spread_safety = 0.3   # center-empty — high fill risk, heavy penalty
 
-        eligible.sort(
-            key=lambda m: (0 if m.is_fallback else 1, m.our_share_estimate),
-            reverse=True,
-        )
+            # Exit liquidity: can we sell on both sides?
+            if m.yes_has_exit and m.no_has_exit:
+                exit_mult = 1.0
+            elif m.yes_has_exit or m.no_has_exit:
+                exit_mult = 0.5  # one-sided only
+            else:
+                exit_mult = 0.1  # no exit — almost worthless
+
+            m.our_share_estimate = expected_daily * vol_risk * spread_safety * exit_mult
+
+        # Sort by score — no fallback penalty, safety is already in the score
+        eligible.sort(key=lambda m: m.our_share_estimate, reverse=True)
 
         # Log top 5 with Q-score breakdown for transparency
         for i, m in enumerate(eligible[:5]):
