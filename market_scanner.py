@@ -545,7 +545,8 @@ class MarketScanner:
         stats = {
             "no_tokens": 0, "no_reward": 0, "bad_midpoint": 0, "too_thick": 0,
             "bad_spread": 0, "low_share": 0, "checked": 0,
-            "fallback": 0, "empty_book": 0, "total": len(all_markets),
+            "fallback": 0, "empty_book": 0, "empty_center": 0,
+            "total": len(all_markets),
         }
 
         for market in all_markets:
@@ -652,7 +653,15 @@ class MarketScanner:
                     spread = 0.0
                     center_is_empty = True
 
-                if mid < 0.40 or mid > 0.60:
+                # SKIP center-empty markets entirely.
+                # If we're the only order near the midpoint, sellers snipe us instantly
+                # and there are no bids to sell back to. We need existing liquidity
+                # near center to hide among. Spread <= 10c means real two-sided book.
+                if center_is_empty:
+                    stats["empty_center"] += 1
+                    continue
+
+                if mid < 0.15 or mid > 0.85:
                     stats["bad_midpoint"] += 1
                     continue
 
@@ -668,10 +677,6 @@ class MarketScanner:
                 max_shares = max(shares_yes, shares_no)
 
                 is_thin = max_depth_usd < 150.0 or max_shares < 500
-
-                # If center is empty, it's always thin where we'd place orders
-                if center_is_empty:
-                    is_thin = True
 
                 # === RULE 3: Spread and best bid/ask ===
                 yes_best_bid = real_yes_bid if real_yes_bid > 0 else 0.0
@@ -699,54 +704,26 @@ class MarketScanner:
                     stats["empty_book"] += 1
                     continue
 
-                # Set defaults for center-empty books (orders exist at edges but not near mid)
-                if center_is_empty:
-                    if yes_best_bid == 0:
-                        yes_best_bid = mid - 0.02
-                    if yes_best_ask == 0:
-                        yes_best_ask = mid + 0.02
-                    if no_best_bid == 0:
-                        no_best_bid = no_mid - 0.02
-                    if no_best_ask == 0:
-                        no_best_ask = no_mid + 0.02
-
-                # Spread must be <= 6c (or empty/center-empty books where we set our own spread)
-                spread_ok = center_is_empty or spread <= 0.06
+                # Spread must be <= 10c — we only want markets with real two-sided book
+                spread_ok = spread <= 0.10
 
                 # === RULE 5: Reward share estimate (using real Polymarket Q score) ===
-                if center_is_empty:
-                    # Center is empty NOW, but existing book depth signals active LPs
-                    # who will likely move to compete for center rewards.
-                    # More depth = more competition risk = lower expected share.
-                    total_depth = depth_yes_usd + depth_no_usd
-                    if total_depth < 500:
-                        share = 1.0   # truly deserted — we'd own the rewards
-                    elif total_depth < 5000:
-                        share = 0.70  # light LP presence, some will compete
-                    elif total_depth < 50000:
-                        share = 0.35  # active LPs, many will move to center
-                    else:
-                        share = 0.15  # deep book, serious MM competition incoming
-                else:
-                    share = self._estimate_reward_share(market, book_yes, book_no, mid)
+                share = self._estimate_reward_share(market, book_yes, book_no, mid)
 
                 volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
 
-                # === DECISION: Skip markets with spread > 6c ===
+                # === DECISION: Skip markets with bad spread ===
                 is_fallback = False
 
                 if not spread_ok:
                     stats["bad_spread"] += 1
                     continue
 
-                if center_is_empty:
-                    # Empty center = we'd be the only LP
-                    pass
-                elif is_thin:
+                if is_thin:
                     # Thin book, good spread — primary target
                     pass
                 elif not is_thin and volume > 0:
-                    # Thick book but has volume — still OK if spread <= 6c
+                    # Thick book but has volume — still OK with tight spread
                     is_fallback = True
                     stats["fallback"] += 1
                 else:
@@ -754,7 +731,7 @@ class MarketScanner:
                     continue
 
                 # Log what we found
-                tag = "FALLBACK" if is_fallback else ("EMPTY" if book_is_empty else "PRIMARY")
+                tag = "FALLBACK" if is_fallback else "PRIMARY"
                 if len(eligible) < 20:
                     log.info(
                         f"  [{tag}] mid:{mid:.2f} | spread:{spread:.3f} | "
@@ -835,6 +812,7 @@ class MarketScanner:
             f"{stats['no_reward']} no/low reward, "
             f"{stats['bad_midpoint']} bad midpoint, "
             f"{stats['empty_book']} empty book, "
+            f"{stats['empty_center']} empty center, "
             f"{stats['too_thick']} too thick, "
             f"{stats['bad_spread']} bad spread | "
             f"Checked {stats['checked']} books"
