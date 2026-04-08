@@ -37,8 +37,11 @@ class BotConfig:
     # Order parameters
     order_size: float = float(os.getenv("ORDER_SIZE", "10"))
     num_price_levels: int = int(os.getenv("NUM_PRICE_LEVELS", "2"))
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.5")) / 100  # cents to decimal
-    max_edge: float = float(os.getenv("MAX_EDGE", "2.5")) / 100
+    # Edge = distance from midpoint. Wider = fewer fills but less Q score.
+    # On center-empty books, tight edge (0.5c) = instant fill = loss.
+    # Default 2c-3c sits near the max_spread boundary (3.5-4.5c) for safety.
+    min_edge: float = float(os.getenv("MIN_EDGE", "2.0")) / 100  # cents to decimal
+    max_edge: float = float(os.getenv("MAX_EDGE", "3.0")) / 100
 
     # Timing
     scan_interval: int = int(os.getenv("SCAN_INTERVAL", "60"))

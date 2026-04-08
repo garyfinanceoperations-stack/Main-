@@ -270,10 +270,16 @@ class RiskManager:
                     continue
 
                 loss = -position.pnl  # positive number means loss
+                cost = position.cost_basis
 
-                # LEVEL 1: Loss exceeds max_loss_per_position ($10 default)
-                # -> Market sell into available liquidity to cap at ~$10
-                if loss >= self.config.max_loss_per_position:
+                # 10% loss threshold — percentage-based, not flat dollar
+                # e.g., $10 position → triggers at $1 loss, $25 → at $2.50
+                loss_pct = loss / max(cost, 0.01)
+                loss_limit_pct = 0.10  # 10% max loss before action
+
+                # LEVEL 1: Loss exceeds 10% of position cost
+                # -> Place SELL limit at loss floor, don't market-sell
+                if loss_pct >= loss_limit_pct and cost > 0:
                     actions.append({
                         "action": "reduce",
                         "condition_id": cid,
@@ -281,16 +287,17 @@ class RiskManager:
                         "side": side,
                         "loss": loss,
                         "size": position.size,
-                        "reason": f"Loss ${loss:.2f} >= limit ${self.config.max_loss_per_position:.2f}",
+                        "reason": f"Loss ${loss:.2f} ({loss_pct:.0%}) >= {loss_limit_pct:.0%} of ${cost:.2f}",
                     })
                     log.warning(
-                        f"RISK: {side} position in {cid[:16]} losing ${loss:.2f} "
-                        f"- scheduling reduction"
+                        f"RISK: {side} in {cid[:16]} losing ${loss:.2f} ({loss_pct:.0%}) "
+                        f"- will hold SELL order, not panic-sell"
                     )
 
-                # LEVEL 2: Loss exceeds emergency threshold ($30 default)
-                # -> Full emergency dump regardless of liquidity
-                if loss >= self.config.emergency_loss_threshold:
+                # LEVEL 2: Loss exceeds emergency threshold ($25 default)
+                # -> Only for catastrophic losses (>25% of position)
+                emergency_pct = 0.25
+                if loss_pct >= emergency_pct and cost > 0:
                     actions.append({
                         "action": "emergency_exit",
                         "condition_id": cid,
@@ -298,11 +305,11 @@ class RiskManager:
                         "side": side,
                         "loss": loss,
                         "size": position.size,
-                        "reason": f"EMERGENCY: Loss ${loss:.2f} >= ${self.config.emergency_loss_threshold:.2f}",
+                        "reason": f"EMERGENCY: Loss ${loss:.2f} ({loss_pct:.0%}) >= {emergency_pct:.0%}",
                     })
                     log.critical(
-                        f"EMERGENCY: {side} position in {cid[:16]} losing ${loss:.2f} "
-                        f"- FULL EXIT REQUIRED"
+                        f"EMERGENCY: {side} in {cid[:16]} losing ${loss:.2f} ({loss_pct:.0%}) "
+                        f"- attempting exit"
                     )
 
         # Check total portfolio loss

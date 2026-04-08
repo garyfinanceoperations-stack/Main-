@@ -366,23 +366,20 @@ class OrderManager:
         has_yes_position = exposure and exposure.yes_position and exposure.yes_position.size > 0
         has_no_position = exposure and exposure.no_position and exposure.no_position.size > 0
 
-        # === SELL orders first for any existing positions (exit + score rewards) ===
-        # Moving sell: tracks midpoint + edge, but never lower than:
-        #   1. buy_price - 0.05 (max 5c loss)
-        #   2. best bid on the book (don't sell below the market)
+        # === SELL orders first for any existing positions ===
+        # Strategy: SELL at breakeven (buy_price) to exit without loss.
+        # Absolute floor: never accept more than 10% loss on the position.
+        # The SELL sits as a limit order — it earns rewards while resting.
         if has_yes_position:
-            mid = midpoint
-            sell_price = round(mid + min_edge, 4)
-            # Floor 1: max 5c below our buy price
             buy_price = exposure.yes_position.avg_price if hasattr(exposure.yes_position, 'avg_price') else exposure.yes_position.cost_basis / max(exposure.yes_position.size, 1)
-            min_sell = round(buy_price - 0.05, 4)
-            # Floor 2: best bid on book (don't go below the market)
-            if market.yes_bid > 0:
-                min_sell = max(min_sell, market.yes_bid)
-            sell_price = max(sell_price, min_sell)
+            # Target: breakeven
+            sell_price = round(buy_price, 4)
+            # Absolute floor: max 10% loss (e.g., bought at $0.48 → floor $0.432)
+            loss_floor = round(buy_price * 0.90, 4)
+            sell_price = max(sell_price, loss_floor)
             sell_price = max(0.02, min(0.99, sell_price))
             log.info(f"  YES SELL: {exposure.yes_position.size:.0f} shares @ ${sell_price:.4f} "
-                     f"(bought ~${buy_price:.4f}, floor ${min_sell:.4f})")
+                     f"(bought ~${buy_price:.4f}, 10% floor ${loss_floor:.4f})")
             oid = self.place_limit_order(
                 market.token_yes, "SELL", sell_price, exposure.yes_position.size,
                 market.condition_id,
@@ -392,18 +389,13 @@ class OrderManager:
             time.sleep(0.1)
 
         if has_no_position:
-            no_mid = 1 - midpoint
-            sell_price = round(no_mid + min_edge, 4)
-            # Floor 1: max 5c below our buy price
             buy_price = exposure.no_position.avg_price if hasattr(exposure.no_position, 'avg_price') else exposure.no_position.cost_basis / max(exposure.no_position.size, 1)
-            min_sell = round(buy_price - 0.05, 4)
-            # Floor 2: best bid on book
-            if market.no_bid > 0:
-                min_sell = max(min_sell, market.no_bid)
-            sell_price = max(sell_price, min_sell)
+            sell_price = round(buy_price, 4)
+            loss_floor = round(buy_price * 0.90, 4)
+            sell_price = max(sell_price, loss_floor)
             sell_price = max(0.02, min(0.99, sell_price))
             log.info(f"  NO  SELL: {exposure.no_position.size:.0f} shares @ ${sell_price:.4f} "
-                     f"(bought ~${buy_price:.4f}, floor ${min_sell:.4f})")
+                     f"(bought ~${buy_price:.4f}, 10% floor ${loss_floor:.4f})")
             oid = self.place_limit_order(
                 market.token_no, "SELL", sell_price, exposure.no_position.size,
                 market.condition_id,
@@ -430,8 +422,8 @@ class OrderManager:
 
             max_per_side = self.config.max_exposure_per_market / 2
 
-            # === YES BUY (only if no existing YES position AND exit liquidity exists) ===
-            if not has_yes_position and getattr(market, 'yes_has_exit', True):
+            # === YES BUY (only if no existing YES position) ===
+            if not has_yes_position:
                 if use_undercut and market.yes_bid > 0:
                     if abs(market.yes_bid - midpoint) <= 0.15:
                         yes_bid_price = round(market.yes_bid + 0.01, 4)
@@ -459,13 +451,11 @@ class OrderManager:
                     if oid:
                         order_ids.append(oid)
                     time.sleep(0.1)
-            elif not getattr(market, 'yes_has_exit', True):
-                log.warning(f"  YES BUY SKIPPED: no exit liquidity (no YES bids on book)")
             else:
                 log.info(f"  YES: holding {exposure.yes_position.size:.0f} shares — BUY skipped, SELL placed")
 
-            # === NO BUY (only if no existing NO position AND exit liquidity exists) ===
-            if not has_no_position and getattr(market, 'no_has_exit', True):
+            # === NO BUY (only if no existing NO position) ===
+            if not has_no_position:
                 no_mid = 1 - midpoint
                 if use_undercut and market.no_bid > 0:
                     if abs(market.no_bid - no_mid) <= 0.15:
@@ -500,8 +490,6 @@ class OrderManager:
                     if oid:
                         order_ids.append(oid)
                     time.sleep(0.1)
-            elif not getattr(market, 'no_has_exit', True):
-                log.warning(f"  NO  BUY SKIPPED: no exit liquidity (no NO bids on book)")
             else:
                 log.info(f"  NO: holding {exposure.no_position.size:.0f} shares — BUY skipped, SELL placed")
 

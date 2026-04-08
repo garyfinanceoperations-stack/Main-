@@ -225,34 +225,13 @@ class PolymarketLPBot:
         for action in actions:
             try:
                 if action["action"] == "reduce":
-                    # Partial sell to cap losses
-                    log.warning(f"RISK REDUCTION: {action['reason']}")
-                    # Cancel orders first
-                    self.orders.cancel_market_orders(action["condition_id"])
-                    time.sleep(0.3)
-                    # Market sell the position
-                    result = self.orders.market_sell(
-                        action["token_id"],
-                        action["size"],
-                        action["condition_id"],
-                        partial=True,
+                    # Don't panic market-sell — hold the SELL limit order.
+                    # On center-empty books, market_sell hits no liquidity and
+                    # records a total loss. Better to keep the SELL order and wait.
+                    log.warning(
+                        f"RISK: {action['reason']} — holding SELL limit order, "
+                        f"NOT panic-selling into empty book."
                     )
-                    if result:
-                        # Only record close if sell actually executed
-                        self.risk.record_close(
-                            action["condition_id"],
-                            action["side"],
-                            0,  # actual proceeds will be updated on fill
-                        )
-                        self.learner.record_trade_result(
-                            action["condition_id"], -action["loss"]
-                        )
-                    else:
-                        # No liquidity to sell — hold position and SELL order
-                        log.warning(
-                            f"  Can't force-sell {action['side']} in {action['condition_id'][:16]} "
-                            f"— no bids. Holding SELL order, will exit when bids appear."
-                        )
 
                 elif action["action"] == "emergency_exit":
                     # Full dump
