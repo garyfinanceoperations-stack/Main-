@@ -619,17 +619,16 @@ class MarketScanner:
                 real_yes_bid = 0.0
                 real_yes_ask = 0.0
 
-                # Find highest bid that's meaningfully near center (> 0.20)
-                # Bids at $0.10 are edge bets, not real LP near midpoint
+                # Find highest bid that's meaningfully near center (> 0.10)
                 for b in yes_bids:
                     p = float(b["price"])
-                    if p >= 0.20:
+                    if p >= 0.10:
                         real_yes_bid = p
                         break
-                # Find lowest ask that's meaningfully near center (< 0.80)
+                # Find lowest ask that's meaningfully near center (< 0.90)
                 for a in yes_asks:
                     p = float(a["price"])
-                    if p <= 0.80:
+                    if p <= 0.90:
                         real_yes_ask = p
                         break
 
@@ -685,12 +684,12 @@ class MarketScanner:
                 no_best_ask = 0.0
                 for b in book_no.get("bids", []):
                     p = float(b["price"])
-                    if p >= 0.20:
+                    if p >= 0.10:
                         no_best_bid = p
                         break
                 for a in book_no.get("asks", []):
                     p = float(a["price"])
-                    if p <= 0.80:
+                    if p <= 0.90:
                         no_best_ask = p
                         break
 
@@ -793,62 +792,42 @@ class MarketScanner:
                 log.debug(f"Error processing market: {e}")
                 continue
 
-        # Score markets using Polymarket's ACTUAL reward formula:
-        # Expected daily reward = reward_pool × our_Q_min_share
-        # Adjusted for: volume risk, spread safety, exit liquidity
+        # Score markets for REWARD FARMING (not profit).
+        # Primary goal: maximize reward accumulation for $POLY airdrop.
+        # Risk is capped by order_manager (breakeven SELL, 10% loss floor, hard cap).
+        # Score = expected daily reward = reward_pool × our_share.
+        # Low liquidity = HIGH share = GOOD (less competition).
+        # Only mild volume discount — high volume means more fills to manage.
         for m in eligible:
             # Expected daily reward based on real Q score share
             expected_daily = m.reward_pool * m.our_share_estimate
 
-            # Volume risk: high volume = more fills = more loss risk
+            # Volume risk: high volume = more fills = more to manage
+            # Keep this mild — losses are capped at 10% per position anyway
             vol = m.volume_24h
-            if vol < 5000:
+            if vol < 10000:
                 vol_risk = 1.0
-            elif vol < 50000:
+            elif vol < 100000:
                 vol_risk = 0.95
-            elif vol < 500000:
-                vol_risk = 0.85
+            elif vol < 1000000:
+                vol_risk = 0.90
             else:
-                vol_risk = 0.70
+                vol_risk = 0.80
 
-            # Spread safety: REAL two-sided book = safe, one-sided/empty = death trap.
-            # m.spread can be synthetic (0.04) when only one side has orders.
-            # Check if both bid AND ask exist on at least the YES side to confirm
-            # a real two-sided book. bid=0 or ask=0 means synthetic spread.
-            has_real_two_sided = (m.yes_bid > 0 and m.yes_ask > 0)
-            real_spread = m.spread if has_real_two_sided else 1.0  # treat one-sided as wide
-
-            if has_real_two_sided and real_spread <= 0.06:
-                spread_safety = 2.0   # tight REAL book — safest
-            elif has_real_two_sided and real_spread <= 0.10:
-                spread_safety = 1.5   # reasonable real book
-            elif has_real_two_sided and real_spread <= 0.20:
-                spread_safety = 1.0   # wide but real two-sided
-            else:
-                spread_safety = 0.3   # one-sided or center-empty — fill risk
-
-            # Exit liquidity: can we sell on both sides?
-            if m.yes_has_exit and m.no_has_exit:
-                exit_mult = 1.0
-            elif m.yes_has_exit or m.no_has_exit:
-                exit_mult = 0.5  # one-sided only
-            else:
-                exit_mult = 0.1  # no exit — almost worthless
-
-            m.our_share_estimate = expected_daily * vol_risk * spread_safety * exit_mult
+            m.our_share_estimate = expected_daily * vol_risk
 
         # Sort by score — no fallback penalty, safety is already in the score
         eligible.sort(key=lambda m: m.our_share_estimate, reverse=True)
 
-        # Log top 5 with Q-score breakdown for transparency
-        for i, m in enumerate(eligible[:5]):
+        # Log top 10 with scoring breakdown for transparency
+        for i, m in enumerate(eligible[:10]):
             depth = m.orderbook_depth_yes + m.orderbook_depth_no
-            # Back-calculate Q share from final score
-            q_share = m.our_share_estimate / max(m.reward_pool, 0.01)
             log.info(
-                f"  TOP {i+1}: ${m.our_share_estimate:.2f}/day expected | "
-                f"pool:${m.reward_pool:.2f} × Q_share:{q_share:.1%} | "
+                f"  TOP {i+1}: ${m.our_share_estimate:.2f}/day | "
+                f"pool:${m.reward_pool:.2f} | "
                 f"depth:${depth:,.0f} | vol:${m.volume_24h:,.0f} | "
+                f"spread:{m.spread:.3f} | mid:{m.midpoint:.2f} | "
+                f"{'EMPTY' if m.center_is_empty else 'LIVE'} | "
                 f"{m.question[:45]}"
             )
 
