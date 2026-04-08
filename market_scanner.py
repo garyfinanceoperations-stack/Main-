@@ -95,7 +95,7 @@ class MarketScanner:
         # Step 1: Fetch all active markets from Gamma (fast)
         gamma_markets = {}
         offset = 0
-        while offset < 800:
+        while offset < 3000:
             try:
                 resp = self._session.get(
                     f"{self.gamma_url}/markets",
@@ -528,13 +528,11 @@ class MarketScanner:
 
     def scan_for_opportunities(self) -> list[MarketInfo]:
         """
-        Main scan with clear rules:
-        1. Midpoint must be 0.40-0.60 (max 60/40 split)
-        2. Depth near midpoint < 500 shares OR < $150/level
-        3. Spread between 2-6 cents (or empty book = we set our own)
-        4. If gap > 2c, we post 1c better than best order
-        5. Must have rewards >= $20/day (or assume $20 if unknown)
-        6. FALLBACK: thick book but high volume = post 1c better with min shares
+        Find reward markets ranked by expected daily reward capture.
+
+        Uses Polymarket's Q-score formula for ALL markets to estimate our share.
+        Minimal filters — let the Q-score math decide what's worth it.
+        Markets with low existing liquidity = high share = ranked highest.
         """
         eligible = []
 
@@ -543,42 +541,33 @@ class MarketScanner:
             log.warning("No reward markets found, trying full market list")
             all_markets = self.get_all_markets()
 
-        # Pre-filter: only keep markets with rewards and valid tokens (no API calls needed)
+        # Pre-filter: only need tokens + rewards + affordable min_size
         candidates = []
-        stats = {
-            "no_tokens": 0, "no_reward": 0, "bad_midpoint": 0, "too_thick": 0,
-            "bad_spread": 0, "low_share": 0, "checked": 0,
-            "fallback": 0, "empty_book": 0, "empty_center": 0,
-            "total": len(all_markets),
-        }
+        skipped = {"no_tokens": 0, "no_reward": 0, "bad_midpoint": 0,
+                   "empty_book": 0, "zero_share": 0}
 
         for market in all_markets:
             tokens = self._get_tokens(market)
             if not tokens:
-                stats["no_tokens"] += 1
+                skipped["no_tokens"] += 1
                 continue
             reward_amount = self._get_reward_amount(market)
             if reward_amount < 1.0:
-                stats["no_reward"] += 1
+                skipped["no_reward"] += 1
                 continue
-            # Skip markets where min shares requirement exceeds our budget
-            # min_size is in shares; at ~$0.50/share, check if we can afford it
             min_shares = self._get_min_size(market)
-            min_usd_needed = min_shares * 0.50  # approximate cost at midpoint
-            if min_usd_needed > self.config.max_exposure_per_market:
-                stats["no_reward"] += 1  # reuse counter
-                log.debug(f"Skipping {market.get('question', '?')[:40]}: "
-                          f"min_size={min_shares:.0f} shares (~${min_usd_needed:.0f}) > budget")
+            if min_shares * 0.50 > self.config.max_exposure_per_market:
+                skipped["no_reward"] += 1
                 continue
             candidates.append((market, tokens, reward_amount))
 
         log.info(
-            f"Pre-filter: {len(candidates)} markets with rewards "
-            f"(skipped {stats['no_tokens']} no tokens, {stats['no_reward']} no reward) "
-            f"out of {stats['total']} total"
+            f"Pre-filter: {len(candidates)} reward markets "
+            f"(skipped {skipped['no_tokens']} no tokens, {skipped['no_reward']} no/low reward) "
+            f"out of {len(all_markets)} total"
         )
 
-        # Fetch order books in parallel batches for speed
+        # Fetch order books in parallel
         def _fetch_books(item):
             market, tokens, reward = item
             book_yes = self.get_orderbook(tokens[0])
@@ -587,6 +576,7 @@ class MarketScanner:
 
         fetched = []
         BATCH_SIZE = 8
+        checked = 0
         for i in range(0, len(candidates), BATCH_SIZE):
             batch = candidates[i:i + BATCH_SIZE]
             with ThreadPoolExecutor(max_workers=BATCH_SIZE) as pool:
@@ -596,49 +586,45 @@ class MarketScanner:
                         fetched.append(f.result())
                     except Exception:
                         pass
-            stats["checked"] += len(batch)
-            if stats["checked"] % 50 == 0 or i + BATCH_SIZE >= len(candidates):
-                log.info(f"  ...fetched {stats['checked']}/{len(candidates)} books...")
+            checked += len(batch)
+            if checked % 50 == 0 or i + BATCH_SIZE >= len(candidates):
+                log.info(f"  ...fetched {checked}/{len(candidates)} books...")
 
-        log.info(f"Scanning {len(fetched)} markets with book data...")
+        log.info(f"Scoring {len(fetched)} markets with Q-score formula...")
 
         for market, tokens, reward_amount, book_yes, book_no in fetched:
             try:
-                token_yes = tokens[0]
-                token_no = tokens[1]
+                token_yes, token_no = tokens[0], tokens[1]
                 condition_id = market.get("conditionId", market.get("condition_id", ""))
                 question = market.get("question", market.get("title", "Unknown"))[:80]
 
-                # === RULE 1: Determine midpoint ===
                 yes_bids = book_yes.get("bids", [])
                 yes_asks = book_yes.get("asks", [])
+                no_bids_list = book_no.get("bids", [])
+                no_asks_list = book_no.get("asks", [])
 
-                # Find the REAL midpoint — where orders actually cluster
-                # Many markets have orders only at extremes (0.001/0.999)
-                # with a huge empty gap in the middle — that's our opportunity
-                real_yes_bid = 0.0
-                real_yes_ask = 0.0
+                # Skip completely empty books (no orders on either side)
+                if not yes_bids and not yes_asks and not no_bids_list and not no_asks_list:
+                    skipped["empty_book"] += 1
+                    continue
 
-                # Find highest bid that's meaningfully near center (> 0.10)
+                # Determine midpoint from YES book
+                real_yes_bid, real_yes_ask = 0.0, 0.0
                 for b in yes_bids:
                     p = float(b["price"])
-                    if p >= 0.10:
+                    if p >= 0.05:
                         real_yes_bid = p
                         break
-                # Find lowest ask that's meaningfully near center (< 0.90)
                 for a in yes_asks:
                     p = float(a["price"])
-                    if p <= 0.90:
+                    if p <= 0.95:
                         real_yes_ask = p
                         break
 
-                # Determine midpoint and whether the book center is empty
                 center_is_empty = False
                 if real_yes_bid > 0 and real_yes_ask > 0:
                     mid = (real_yes_bid + real_yes_ask) / 2
                     spread = real_yes_ask - real_yes_bid
-                    # If the gap between nearest orders is huge (> 20c),
-                    # the center is effectively empty — we'd be the only LP there
                     if spread > 0.20:
                         center_is_empty = True
                 elif real_yes_bid > 0:
@@ -650,117 +636,77 @@ class MarketScanner:
                     spread = 0.04
                     center_is_empty = True
                 else:
-                    # No orders near center at all — fully empty
-                    mid = 0.5
-                    spread = 0.0
+                    # No YES orders — try NO side to infer midpoint
+                    no_bid, no_ask = 0.0, 0.0
+                    for b in no_bids_list:
+                        p = float(b["price"])
+                        if p >= 0.05:
+                            no_bid = p
+                            break
+                    for a in no_asks_list:
+                        p = float(a["price"])
+                        if p <= 0.95:
+                            no_ask = p
+                            break
+                    if no_bid > 0 and no_ask > 0:
+                        no_mid_est = (no_bid + no_ask) / 2
+                        mid = 1.0 - no_mid_est
+                    elif no_bid > 0:
+                        mid = 1.0 - (no_bid + 0.02)
+                    elif no_ask > 0:
+                        mid = 1.0 - (no_ask - 0.02)
+                    else:
+                        mid = 0.5
+                    spread = 0.04
                     center_is_empty = True
 
-                # Center-empty markets are allowed but flagged.
-                # Order manager will check per-side exit liquidity before placing.
-
-                if mid < 0.15 or mid > 0.85:
-                    stats["bad_midpoint"] += 1
+                # Very wide midpoint range — almost any odds are fine
+                if mid < 0.05 or mid > 0.95:
+                    skipped["bad_midpoint"] += 1
                     continue
 
                 no_mid = 1.0 - mid
 
-                # === RULE 2: Depth check - < 500 shares OR < $150/level near mid ===
-                depth_yes_usd = self._get_depth_near_mid(book_yes, mid)
-                depth_no_usd = self._get_depth_near_mid(book_no, no_mid)
-                max_depth_usd = max(depth_yes_usd, depth_no_usd)
-
-                shares_yes = self._get_total_shares_near_mid(book_yes, mid)
-                shares_no = self._get_total_shares_near_mid(book_no, no_mid)
-                max_shares = max(shares_yes, shares_no)
-
-                is_thin = max_depth_usd < 150.0 or max_shares < 500
-
-                # === RULE 3: Spread and best bid/ask ===
-                yes_best_bid = real_yes_bid if real_yes_bid > 0 else 0.0
-                yes_best_ask = real_yes_ask if real_yes_ask > 0 else 0.0
-
-                # Find NO side best bid/ask near mid too
-                no_best_bid = 0.0
-                no_best_ask = 0.0
-                for b in book_no.get("bids", []):
+                # Best bid/ask for order placement (used by order_manager)
+                yes_best_bid = real_yes_bid
+                yes_best_ask = real_yes_ask
+                no_best_bid, no_best_ask = 0.0, 0.0
+                for b in no_bids_list:
                     p = float(b["price"])
-                    if p >= 0.10:
+                    if p >= 0.05:
                         no_best_bid = p
                         break
-                for a in book_no.get("asks", []):
+                for a in no_asks_list:
                     p = float(a["price"])
-                    if p <= 0.90:
+                    if p <= 0.95:
                         no_best_ask = p
                         break
 
-                # SKIP truly empty books — no orders at all
-                book_is_empty = (len(yes_bids) == 0 and len(yes_asks) == 0)
-                if book_is_empty:
-                    stats["empty_book"] += 1
-                    continue
-
-                # Per-side exit liquidity: can we sell back after a fill?
-                # Need bids within 15c of midpoint — bids at $0.20 when mid is $0.50
-                # are NOT exit liquidity (that's a 60% loss).
-                no_bids = book_no.get("bids", [])
-
-                yes_exit_threshold = mid - 0.15  # e.g., 0.35 for mid=0.50
+                # Exit liquidity (for display only — does NOT affect scoring)
+                yes_exit_threshold = mid - 0.15
                 no_exit_threshold = no_mid - 0.15
-
                 yes_has_exit = any(
                     float(b["price"]) >= yes_exit_threshold for b in yes_bids
                 ) if yes_bids else False
                 no_has_exit = any(
-                    float(b["price"]) >= no_exit_threshold for b in no_bids
-                ) if no_bids else False
+                    float(b["price"]) >= no_exit_threshold for b in no_bids_list
+                ) if no_bids_list else False
 
-                # Spread check: tight books are ideal, center-empty still allowed
-                spread_ok = center_is_empty or spread <= 0.10
+                # Q-score share — ALWAYS use the real formula, never a proxy
+                share = self._estimate_reward_share(market, book_yes, book_no, mid)
 
-                # === RULE 5: Reward share estimate (using real Polymarket Q score) ===
-                if center_is_empty:
-                    # Center-empty: estimate share based on book depth (proxy for competition)
-                    total_depth = depth_yes_usd + depth_no_usd
-                    if total_depth < 500:
-                        share = 1.0
-                    elif total_depth < 5000:
-                        share = 0.70
-                    elif total_depth < 50000:
-                        share = 0.35
-                    else:
-                        share = 0.15
-                else:
-                    share = self._estimate_reward_share(market, book_yes, book_no, mid)
+                if share <= 0:
+                    skipped["zero_share"] += 1
+                    continue
 
                 volume = float(market.get("volume", market.get("volume24hr", 0)) or 0)
 
-                # === DECISION: Skip markets with bad spread ===
-                is_fallback = False
+                # Total book depth (for display/learner, not scoring)
+                depth_yes = self._calculate_book_depth(book_yes, "bids") + self._calculate_book_depth(book_yes, "asks")
+                depth_no = self._calculate_book_depth(book_no, "bids") + self._calculate_book_depth(book_no, "asks")
 
-                if not spread_ok:
-                    stats["bad_spread"] += 1
-                    continue
-
-                if is_thin:
-                    # Thin book, good spread — primary target
-                    pass
-                elif not is_thin and volume > 0:
-                    # Thick book but has volume — still OK with tight spread
-                    is_fallback = True
-                    stats["fallback"] += 1
-                else:
-                    stats["too_thick"] += 1
-                    continue
-
-                # Log what we found
-                tag = "FALLBACK" if is_fallback else "PRIMARY"
-                if len(eligible) < 20:
-                    log.info(
-                        f"  [{tag}] mid:{mid:.2f} | spread:{spread:.3f} | "
-                        f"depth:${max_depth_usd:.0f}/{max_shares:.0f}sh | "
-                        f"share:{share:.0%} | reward:${reward_amount:.2f} | "
-                        f"{question[:50]}"
-                    )
+                # is_fallback drives undercut logic in order_manager
+                is_fallback = spread > 0.06 or center_is_empty
 
                 info = MarketInfo(
                     condition_id=condition_id,
@@ -777,8 +723,8 @@ class MarketScanner:
                     max_spread=self._get_max_spread(market),
                     min_size=self._get_min_size(market),
                     volume_24h=volume,
-                    orderbook_depth_yes=depth_yes_usd,
-                    orderbook_depth_no=depth_no_usd,
+                    orderbook_depth_yes=depth_yes,
+                    orderbook_depth_no=depth_no,
                     our_share_estimate=share,
                     neg_risk=bool(market.get("negRisk", market.get("neg_risk", False))),
                     is_fallback=is_fallback,
@@ -792,18 +738,9 @@ class MarketScanner:
                 log.debug(f"Error processing market: {e}")
                 continue
 
-        # Score markets for REWARD FARMING (not profit).
-        # Primary goal: maximize reward accumulation for $POLY airdrop.
-        # Risk is capped by order_manager (breakeven SELL, 10% loss floor, hard cap).
-        # Score = expected daily reward = reward_pool × our_share.
-        # Low liquidity = HIGH share = GOOD (less competition).
-        # Only mild volume discount — high volume means more fills to manage.
+        # Score = reward_pool × Q_share × mild_vol_risk
         for m in eligible:
-            # Expected daily reward based on real Q score share
             expected_daily = m.reward_pool * m.our_share_estimate
-
-            # Volume risk: high volume = more fills = more to manage
-            # Keep this mild — losses are capped at 10% per position anyway
             vol = m.volume_24h
             if vol < 10000:
                 vol_risk = 1.0
@@ -813,33 +750,30 @@ class MarketScanner:
                 vol_risk = 0.90
             else:
                 vol_risk = 0.80
-
             m.our_share_estimate = expected_daily * vol_risk
 
-        # Sort by score — no fallback penalty, safety is already in the score
         eligible.sort(key=lambda m: m.our_share_estimate, reverse=True)
 
-        # Log top 10 with scoring breakdown for transparency
-        for i, m in enumerate(eligible[:10]):
+        # Log top 15 for transparency
+        for i, m in enumerate(eligible[:15]):
             depth = m.orderbook_depth_yes + m.orderbook_depth_no
+            q_share = m.our_share_estimate / max(m.reward_pool, 0.01) if m.reward_pool > 0 else 0
             log.info(
-                f"  TOP {i+1}: ${m.our_share_estimate:.2f}/day | "
-                f"pool:${m.reward_pool:.2f} | "
+                f"  #{i+1}: ${m.our_share_estimate:.2f}/day | "
+                f"pool:${m.reward_pool:.0f} | Q:{q_share:.0%} | "
                 f"depth:${depth:,.0f} | vol:${m.volume_24h:,.0f} | "
-                f"spread:{m.spread:.3f} | mid:{m.midpoint:.2f} | "
+                f"spread:{m.spread:.2f} | mid:{m.midpoint:.2f} | "
                 f"{'EMPTY' if m.center_is_empty else 'LIVE'} | "
-                f"{m.question[:45]}"
+                f"{m.question[:40]}"
             )
 
         log.info(
-            f"Scan: {len(eligible)} eligible ({stats['fallback']} fallback) | "
-            f"Skipped: {stats['no_tokens']} no tokens, "
-            f"{stats['no_reward']} no/low reward, "
-            f"{stats['bad_midpoint']} bad midpoint, "
-            f"{stats['empty_book']} empty book, "
-            f"{stats['empty_center']} empty center, "
-            f"{stats['too_thick']} too thick, "
-            f"{stats['bad_spread']} bad spread | "
-            f"Checked {stats['checked']} books"
+            f"Scan complete: {len(eligible)} eligible | "
+            f"Skipped: {skipped['no_tokens']} no tokens, "
+            f"{skipped['no_reward']} no/low reward, "
+            f"{skipped['bad_midpoint']} bad midpoint, "
+            f"{skipped['empty_book']} empty book, "
+            f"{skipped['zero_share']} zero Q share | "
+            f"Checked {checked} books"
         )
         return eligible

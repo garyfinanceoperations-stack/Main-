@@ -353,9 +353,9 @@ class Learner:
 
         rec = self.markets.get(condition_id)
         if not rec or rec.sessions_active < self.MIN_SESSIONS_FOR_SCORING:
-            # Not enough data - use base score + similarity bonus
-            similarity = self._similarity_score(spread, reward_pool, book_depth)
-            return base_score * (1.0 + similarity * 0.3)
+            # Not enough history — trust the Q-score formula, no similarity bias.
+            # Similarity scoring created a feedback loop toward the same bad markets.
+            return base_score
 
         # Historical performance multiplier
         # Range: 0.3x (terrible) to 2.0x (great)
